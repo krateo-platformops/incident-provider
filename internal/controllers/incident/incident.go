@@ -1,7 +1,8 @@
 // Package incident is the controller of Incident managed resources. An Incident has no external
 // resource: Observe always finds it, and decides from the Incident whether its current step, the
 // precondition while Open or verify while Verifying, has a result to record or a run to start.
-// Check pods only carry the runs.
+// Check pods only carry the runs. Observe also reads, once a poll interval, whether the Alert that
+// opened an Open or Verifying incident still exists.
 package incident
 
 import (
@@ -16,6 +17,8 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -38,6 +41,9 @@ import (
 var errNotIncident = errors.New("managed resource is not an Incident")
 
 const actionReconcile event.Action = "Reconcile"
+
+// AlertGroupVersionKind is the Alert an Incident's spec.alertRef names. alert-provider serves it.
+var AlertGroupVersionKind = schema.GroupVersionKind{Group: "observability.krateo.io", Version: "v1alpha1", Kind: "Alert"}
 
 // Options configure the Incident controller.
 type Options struct {
@@ -64,7 +70,10 @@ func Setup(mgr ctrl.Manager, o Options) error {
 
 	r := reconciler.NewReconciler(mgr,
 		resource.ManagedKind(v1alpha1.IncidentGroupVersionKind),
-		reconciler.WithExternalConnecter(&connector{kube: mgr.GetClient(), cfg: cfg, pods: o.Pods, runs: runs, log: log, rec: rec}),
+		// Alerts are read past the cache, one at a time: no informer on every Alert, and a
+		// missing Alert CRD is one failed read, not a cache that never syncs.
+		reconciler.WithExternalConnecter(&connector{kube: mgr.GetClient(), alerts: mgr.GetAPIReader(), cfg: cfg, pods: o.Pods,
+			runs: runs, alertReads: newLastRuns(), log: log, rec: rec}),
 		reconciler.WithPollInterval(cfg.PollInterval),
 		reconciler.WithPollIntervalHook(runs.pollIntervalHook),
 		reconciler.WithLogger(log),
@@ -143,12 +152,15 @@ func (l *lastRuns) pollIntervalHook(mg resource.Managed, poll time.Duration) tim
 }
 
 type connector struct {
-	kube client.Client
-	cfg  Config
-	pods CheckPods
-	runs *lastRuns
-	log  logging.Logger
-	rec  event.Recorder
+	kube   client.Client
+	alerts client.Reader
+	cfg    Config
+	pods   CheckPods
+	runs   *lastRuns
+	// alertReads is when each incident's Alert was last read.
+	alertReads *lastRuns
+	log        logging.Logger
+	rec        event.Recorder
 }
 
 func (c *connector) Connect(_ context.Context, mg resource.Managed) (reconciler.ExternalClient, error) {
@@ -157,13 +169,15 @@ func (c *connector) Connect(_ context.Context, mg resource.Managed) (reconciler.
 		return nil, errNotIncident
 	}
 	return &external{
-		kube: c.kube,
-		cfg:  c.cfg,
-		pods: c.pods,
-		runs: c.runs,
-		log:  c.log.WithValues("incident", inc.Namespace+"/"+inc.Name),
-		rec:  c.rec,
-		now:  time.Now,
+		kube:       c.kube,
+		alerts:     c.alerts,
+		cfg:        c.cfg,
+		pods:       c.pods,
+		runs:       c.runs,
+		alertReads: c.alertReads,
+		log:        c.log.WithValues("incident", inc.Namespace+"/"+inc.Name),
+		rec:        c.rec,
+		now:        time.Now,
 	}, nil
 }
 
@@ -203,14 +217,16 @@ func (p plan) String() string {
 }
 
 type external struct {
-	kube client.Client
-	cfg  Config
-	pods CheckPods
-	runs *lastRuns
-	log  logging.Logger
-	rec  event.Recorder
-	now  func() time.Time
-	plan plan
+	kube       client.Client
+	alerts     client.Reader
+	cfg        Config
+	pods       CheckPods
+	runs       *lastRuns
+	alertReads *lastRuns
+	log        logging.Logger
+	rec        event.Recorder
+	now        func() time.Time
+	plan       plan
 }
 
 // Observe reads the incident's check pods, records the finished ones and applies the resulting
@@ -229,6 +245,7 @@ func (e *external) Observe(ctx context.Context, mg resource.Managed) (reconciler
 	}
 	if meta.WasDeleted(inc) {
 		e.runs.forget(inc.UID)
+		e.alertReads.forget(inc.UID)
 		// A deleted Incident is Deleting. provider-runtime sets that itself while it deletes, after
 		// a successful Observe and after a failed one (v1.8.2), so this write is not required;
 		// it keeps every successful Observe answering Ready.
@@ -240,6 +257,7 @@ func (e *external) Observe(ctx context.Context, mg resource.Managed) (reconciler
 	before := inc.Status.DeepCopy()
 	changes, consumed := applySpec(inc, now)
 	e.plan = plan{changes: changes, consumeApplied: consumed}
+	e.plan.changes = append(e.plan.changes, observeAlert(inc, e.cfg, e.readAlert(ctx, inc, now), now)...)
 
 	sort.Slice(pods, func(i, j int) bool { return pods[i].CreationTimestamp.Before(&pods[j].CreationTimestamp) })
 	for i := range pods {
@@ -264,6 +282,7 @@ func (e *external) Observe(ctx context.Context, mg resource.Managed) (reconciler
 			e.plan.stale = append(e.plan.stale, *pod)
 		}
 	}
+	syncChecksUnknown(inc, now)
 	e.plan.dirty = consumed || !equality.Semantic.DeepEqual(before, &inc.Status)
 	lastRun := e.runs.get(inc.UID)
 	e.plan.due = e.plan.live == nil && checkDue(inc, e.cfg, lastRun, now)
@@ -297,7 +316,7 @@ func (e *external) Update(ctx context.Context, mg resource.Managed) error {
 		}
 		for _, c := range e.plan.changes {
 			e.rec.Event(inc, event.Normal(event.Reason(c.reason), actionReconcile, c.message))
-			e.log.Info(c.message, "reason", c.reason)
+			e.log.Info(c.message, append([]any{"reason", c.reason}, c.kv...)...)
 		}
 	}
 	if e.plan.consumeApplied {
@@ -351,6 +370,46 @@ func (e *external) list(ctx context.Context, inc *v1alpha1.Incident) ([]corev1.P
 		return nil, nil, fmt.Errorf("cannot list check ConfigMaps: %w", err)
 	}
 	return pods.Items, cms.Items, nil
+}
+
+// readAlert reads whether the Alert in spec.alertRef of an Open or Verifying incident exists, at
+// most once a poll interval. Only a NotFound that names the Alert counts as gone: a missing Alert
+// CRD, a denied read or an unreachable API server leave it unread.
+func (e *external) readAlert(ctx context.Context, inc *v1alpha1.Incident, now time.Time) alertState {
+	if e.alerts == nil {
+		return alertUnread
+	}
+	if s := inc.Status.State; s != v1alpha1.StateOpen && s != v1alpha1.StateVerifying {
+		return alertUnread
+	}
+	if last := e.alertReads.get(inc.UID); !last.IsZero() && now.Sub(last) < e.cfg.PollInterval {
+		return alertUnread
+	}
+	e.alertReads.seen(inc.UID, now)
+	ref := inc.Spec.AlertRef
+	alert := &metav1.PartialObjectMetadata{}
+	alert.SetGroupVersionKind(AlertGroupVersionKind)
+	err := e.alerts.Get(ctx, client.ObjectKey{Namespace: ref.Namespace, Name: ref.Name}, alert)
+	switch {
+	case err == nil:
+		return alertFound
+	case alertNotFoundErr(err, ref.Name):
+		return alertNotFound
+	}
+	e.log.Debug("cannot read the incident's Alert", "alert", ref.Namespace+"/"+ref.Name, "error", err.Error())
+	return alertUnread
+}
+
+// alertNotFoundErr reports whether err is the API server's NotFound for the Alert named name. A
+// NotFound for the resource type itself, from a REST mapping that outlived the Alert CRD, names
+// no object.
+func alertNotFoundErr(err error, name string) bool {
+	var st apierrors.APIStatus
+	if !errors.As(err, &st) {
+		return false
+	}
+	s := st.Status()
+	return s.Reason == metav1.StatusReasonNotFound && s.Details != nil && s.Details.Name == name
 }
 
 // startCheck creates the check pod, then the ConfigMap with its script, owned by the pod. The

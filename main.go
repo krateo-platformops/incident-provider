@@ -6,6 +6,7 @@ import (
 	"flag"
 	"fmt"
 	"log/slog"
+	"math"
 	"os"
 	"time"
 
@@ -42,6 +43,9 @@ func main() {
 	syncPeriod := flag.Duration("sync", env.Duration(envKey("SYNC_PERIOD"), time.Hour), "Controller manager sync period such as 300ms, 1.5h, or 2h45m.")
 	pollInterval := flag.Duration("poll", env.Duration(envKey("POLL_INTERVAL"), time.Minute), "Time from the end of one check of an incident to the start of the next.")
 	settleWindow := flag.Duration("settle-window", env.Duration(envKey("SETTLE_WINDOW"), 5*time.Minute), "How long, from entering Verifying, a verify exit 1 is retried before the incident goes back to Open.")
+	noVerdictRuns := flag.Int("no-verdict-runs", env.Int(envKey("NO_VERDICT_RUNS"), 6), "Consecutive precondition or verify runs without exit 0 or 1 after which the script stops and ChecksUnknown is set; 0 = no run bound.")
+	noVerdictFor := flag.Duration("no-verdict-for", env.Duration(envKey("NO_VERDICT_FOR"), 24*time.Hour), "How long precondition or verify runs may give no exit 0 or 1 before the script stops and ChecksUnknown is set; 0 = no time bound.")
+	alertGoneGrace := flag.Duration("alert-gone-grace", env.Duration(envKey("ALERT_GONE_GRACE"), 10*time.Minute), "How long an Open or Verifying incident's Alert must stay NotFound before the incident is closed with resolution.by alert-gone.")
 	checkTimeout := flag.Duration("check-timeout", env.Duration(envKey("CHECK_TIMEOUT"), time.Minute), "Deadline of one check run: the check pod's activeDeadlineSeconds.")
 	checksNamespace := flag.String("checks-namespace", env.String(envKey("CHECKS_NAMESPACE"), ""), "Namespace the check pods run in.")
 	applyTimeout := flag.Duration("apply-timeout", env.Duration(envKey("APPLY_TIMEOUT"), 2*time.Minute), "Deadline of one IncidentApply run: the apply pod's activeDeadlineSeconds.")
@@ -84,7 +88,13 @@ func main() {
 		checkReader:     checkreader.Options{Role: *checkReaderRole, Interval: *checkReaderRefresh, Log: log},
 		incident: incident.Options{
 			Controller: controllerOptions,
-			Checks:     incident.Config{SettleWindow: *settleWindow, CheckTimeout: *checkTimeout},
+			Checks: incident.Config{
+				SettleWindow:   *settleWindow,
+				CheckTimeout:   *checkTimeout,
+				NoVerdictRuns:  int32(min(max(*noVerdictRuns, 0), math.MaxInt32)),
+				NoVerdictFor:   *noVerdictFor,
+				AlertGoneGrace: *alertGoneGrace,
+			},
 		},
 		apply: incident.ApplyOptions{
 			Controller: controllerOptions,
@@ -132,6 +142,9 @@ func run(log logging.Logger, o runOptions) error {
 		"poll-interval", o.incident.Controller.PollInterval.String(),
 		"settle-window", o.incident.Checks.SettleWindow.String(),
 		"check-timeout", o.incident.Checks.CheckTimeout.String(),
+		"no-verdict-runs", o.incident.Checks.NoVerdictRuns,
+		"no-verdict-for", o.incident.Checks.NoVerdictFor.String(),
+		"alert-gone-grace", o.incident.Checks.AlertGoneGrace.String(),
 		"checks-namespace", o.checksNamespace,
 		"apply-timeout", o.apply.Applies.Timeout.String(),
 		"apply-ttl", o.apply.Applies.TTL.String(),

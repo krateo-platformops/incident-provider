@@ -266,7 +266,8 @@ spec:
               lastChecks:
                 description: |-
                   LastChecks is the latest result of each script. It changes only when a result does, so a
-                  check that keeps giving the same result writes nothing.
+                  check that keeps giving the same verdict writes nothing; each unknown run is counted in its
+                  noVerdict streak, up to the bound that stops the script.
                 properties:
                   apply:
                     description: LastCheck is the latest result of a script.
@@ -279,6 +280,33 @@ spec:
                         maximum: 255
                         minimum: 0
                         type: integer
+                      noVerdict:
+                        description: |-
+                          NoVerdict is the streak of consecutive precondition or verify runs without a verdict that
+                          ends at this result, whatever their exit codes. It is set only for unknown results; a
+                          verdict, 0 or 1, ends the streak.
+                        properties:
+                          last:
+                            description: |-
+                              Last is when the latest run of the streak ended. A run that ended no later is not counted
+                              again.
+                            format: date-time
+                            type: string
+                          runs:
+                            description: Runs is how many runs the streak has.
+                            format: int32
+                            minimum: 1
+                            type: integer
+                          since:
+                            description: Since is when the first run of the streak
+                              ended.
+                            format: date-time
+                            type: string
+                        required:
+                        - last
+                        - runs
+                        - since
+                        type: object
                       output:
                         description: |-
                           Output is what an unknown precondition or verify run printed (the end of its log, cut to 512
@@ -306,6 +334,33 @@ spec:
                         maximum: 255
                         minimum: 0
                         type: integer
+                      noVerdict:
+                        description: |-
+                          NoVerdict is the streak of consecutive precondition or verify runs without a verdict that
+                          ends at this result, whatever their exit codes. It is set only for unknown results; a
+                          verdict, 0 or 1, ends the streak.
+                        properties:
+                          last:
+                            description: |-
+                              Last is when the latest run of the streak ended. A run that ended no later is not counted
+                              again.
+                            format: date-time
+                            type: string
+                          runs:
+                            description: Runs is how many runs the streak has.
+                            format: int32
+                            minimum: 1
+                            type: integer
+                          since:
+                            description: Since is when the first run of the streak
+                              ended.
+                            format: date-time
+                            type: string
+                        required:
+                        - last
+                        - runs
+                        - since
+                        type: object
                       output:
                         description: |-
                           Output is what an unknown precondition or verify run printed (the end of its log, cut to 512
@@ -333,6 +388,33 @@ spec:
                         maximum: 255
                         minimum: 0
                         type: integer
+                      noVerdict:
+                        description: |-
+                          NoVerdict is the streak of consecutive precondition or verify runs without a verdict that
+                          ends at this result, whatever their exit codes. It is set only for unknown results; a
+                          verdict, 0 or 1, ends the streak.
+                        properties:
+                          last:
+                            description: |-
+                              Last is when the latest run of the streak ended. A run that ended no later is not counted
+                              again.
+                            format: date-time
+                            type: string
+                          runs:
+                            description: Runs is how many runs the streak has.
+                            format: int32
+                            minimum: 1
+                            type: integer
+                          since:
+                            description: Since is when the first run of the streak
+                              ended.
+                            format: date-time
+                            type: string
+                        required:
+                        - last
+                        - runs
+                        - since
+                        type: object
                       output:
                         description: |-
                           Output is what an unknown precondition or verify run printed (the end of its log, cut to 512
@@ -410,11 +492,12 @@ spec:
                     format: date-time
                     type: string
                   by:
-                    description: 'By is what ended it: verify (state Resolved) or
-                      user (state Closed).'
+                    description: 'By is what ended it: verify (state Resolved), or
+                      user or alert-gone (state Closed).'
                     enum:
                     - verify
                     - user
+                    - alert-gone
                     type: string
                 required:
                 - at
@@ -480,7 +563,7 @@ spec:
               rule: has(self.resolution) == (has(self.state) && self.state in ['Resolved',
                 'Closed'])
             - message: Resolved goes with resolution.by verify, Closed with resolution.by
-                user
+                user or alert-gone
               rule: '!has(self.resolution) || (has(self.state) && ((self.resolution.by
                 == ''verify'') == (self.state == ''Resolved'')))'
             - message: Resolved can only become Closed, and Closed is final

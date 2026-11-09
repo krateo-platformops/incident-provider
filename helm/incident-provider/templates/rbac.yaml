@@ -22,6 +22,10 @@ rules:
   - apiGroups: ["observability.krateo.io"]
     resources: ["incidentapplies/status"]
     verbs: ["get", "update", "patch"]
+  # Whether the Alert in an incident's spec.alertRef still exists (condition AlertGone).
+  - apiGroups: ["observability.krateo.io"]
+    resources: ["alerts"]
+    verbs: ["get"]
   # Whether the requester may patch the incident: running its apply script takes that right.
   - apiGroups: ["authorization.k8s.io"]
     resources: ["subjectaccessreviews"]

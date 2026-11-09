@@ -17,6 +17,14 @@ controller:
   # How long, from entering Verifying, a verify exit 1 is retried before the incident goes back
   # to Open.
   settleWindow: 5m
+  # The no-verdict bound: a precondition (while Open) or verify (while Verifying) whose runs give
+  # no exit 0 or 1 for noVerdictRuns runs in a row, or for noVerdictFor, stops, and the incident
+  # gets ChecksUnknown=True with the last exit code and output. 0 disables a bound.
+  noVerdictRuns: 6
+  noVerdictFor: 24h
+  # How long the Alert in an Open or Verifying incident's spec.alertRef must stay NotFound before
+  # the incident is closed with resolution.by alert-gone (condition AlertGone).
+  alertGoneGrace: 10m
   syncPeriod: 1h
   maxReconcileRate: 5
   leaderElection: true

@@ -38,6 +38,12 @@ spec:
               value: {{ .Values.controller.pollInterval | quote }}
             - name: INCIDENT_PROVIDER_SETTLE_WINDOW
               value: {{ .Values.controller.settleWindow | quote }}
+            - name: INCIDENT_PROVIDER_NO_VERDICT_RUNS
+              value: {{ .Values.controller.noVerdictRuns | quote }}
+            - name: INCIDENT_PROVIDER_NO_VERDICT_FOR
+              value: {{ .Values.controller.noVerdictFor | quote }}
+            - name: INCIDENT_PROVIDER_ALERT_GONE_GRACE
+              value: {{ .Values.controller.alertGoneGrace | quote }}
             - name: INCIDENT_PROVIDER_SYNC_PERIOD
               value: {{ .Values.controller.syncPeriod | quote }}
             - name: INCIDENT_PROVIDER_MAX_RECONCILE_RATE

@@ -20,13 +20,16 @@ type State string
 const (
 	// StateAnalyzing: the root-cause analysis runs. No check runs.
 	StateAnalyzing State = "Analyzing"
-	// StateOpen: the incident holds. The precondition runs every poll interval.
+	// StateOpen: the incident holds. The precondition runs every poll interval, until it gives no
+	// verdict for too long (condition ChecksUnknown).
 	StateOpen State = "Open"
-	// StateVerifying: the precondition exited 0, or a human applied the fix. The verify script runs.
+	// StateVerifying: the precondition exited 0, or a human applied the fix. The verify script
+	// runs, until it gives no verdict for too long (condition ChecksUnknown).
 	StateVerifying State = "Verifying"
 	// StateResolved: the verify script exited 0.
 	StateResolved State = "Resolved"
-	// StateClosed: a human closed the incident.
+	// StateClosed: a human closed the incident, or the controller did because its Alert was
+	// deleted.
 	StateClosed State = "Closed"
 )
 
@@ -52,7 +55,7 @@ const (
 )
 
 // ResolvedBy is what ended an incident.
-// +kubebuilder:validation:Enum=verify;user
+// +kubebuilder:validation:Enum=verify;user;alert-gone
 type ResolvedBy string
 
 const (
@@ -60,6 +63,9 @@ const (
 	ResolvedByVerify ResolvedBy = "verify"
 	// ResolvedByUser: a human closed the incident. Goes with state Closed.
 	ResolvedByUser ResolvedBy = "user"
+	// ResolvedByAlertGone: the Alert in spec.alertRef was deleted, and stayed deleted for the
+	// alert-gone grace. Goes with state Closed: nothing proved the problem gone.
+	ResolvedByAlertGone ResolvedBy = "alert-gone"
 )
 
 // SourceType is the kind of a piece of evidence.
@@ -73,16 +79,46 @@ const (
 	SourceObject  SourceType = "object"
 )
 
-// TypeReproduced is a condition on the first precondition run. True: it exited 1, so the script
-// sees the incident. False: it exited 0, so the script cannot see the incident. Such an incident is
-// flagged: it stays Open, its precondition no longer runs, and only spec.applied or spec.closed
-// moves it. Absent until the first run.
+// TypeReproduced is a condition on the first precondition run with a verdict. True: it exited 1,
+// so the script sees the incident. False: it exited 0, so the problem was gone by the first check;
+// the incident moves to Verifying and verify decides. It is a record only: neither status stops a
+// script. Absent until the first verdict.
 const TypeReproduced prv1.ConditionType = "Reproduced"
 
 // Reasons of the Reproduced condition.
 const (
 	ReasonPreconditionHolds  prv1.ConditionReason = "PreconditionHolds"
 	ReasonPreconditionPassed prv1.ConditionReason = "PreconditionPassed"
+)
+
+// TypeChecksUnknown is a condition on the current script. True: it gave no verdict (no exit 0 or
+// 1) in too many consecutive runs, or for too long, so it no longer runs; the message carries the
+// last exit code and output. Only spec.applied, spec.closed, spec.reanalysis or an apply run that
+// exits 0 moves such an incident. False: the script it named is no longer current. Absent while
+// no script has hit the bound.
+const TypeChecksUnknown prv1.ConditionType = "ChecksUnknown"
+
+// Reasons of the ChecksUnknown condition.
+const (
+	// ReasonPreconditionNoVerdict: True, the precondition hit the bound while Open.
+	ReasonPreconditionNoVerdict prv1.ConditionReason = "PreconditionNoVerdict"
+	// ReasonVerifyNoVerdict: True, verify hit the bound while Verifying.
+	ReasonVerifyNoVerdict prv1.ConditionReason = "VerifyNoVerdict"
+	// ReasonChecksResumed: False, the script that hit the bound is no longer current: the state
+	// changed, or a reanalysis replaced the scripts.
+	ReasonChecksResumed prv1.ConditionReason = "ChecksResumed"
+)
+
+// TypeAlertGone is a condition on the Alert in spec.alertRef, read while the incident is Open or
+// Verifying. True: the API server answered NotFound for it. Once True for the alert-gone grace,
+// the controller closes the incident with resolution.by alert-gone. False: the Alert exists again.
+// Absent while the Alert has always been found.
+const TypeAlertGone prv1.ConditionType = "AlertGone"
+
+// Reasons of the AlertGone condition.
+const (
+	ReasonAlertNotFound prv1.ConditionReason = "AlertNotFound"
+	ReasonAlertFound    prv1.ConditionReason = "AlertFound"
 )
 
 // AlertRef locates the Alert that opened an Incident.
@@ -165,7 +201,8 @@ type Reanalysis struct {
 // HowToFix is the fix as bash scripts, written by the root-cause analysis. The controller runs
 // precondition and verify in a read-only sandbox; a human runs apply, and rollback to undo it. For
 // precondition and verify, exit 0 means the incident is gone and exit 1 that it holds; any other
-// exit, or a timeout, is unknown and changes nothing.
+// exit, or a timeout, is unknown and changes no state. A script that stays unknown too long stops
+// (condition ChecksUnknown).
 type HowToFix struct {
 	// Precondition tests whether the incident still holds. It tests the root-cause object, never
 	// the alert's rows.
@@ -238,6 +275,26 @@ type LastCheck struct {
 	// +kubebuilder:validation:MaxLength=512
 	// +optional
 	Output string `json:"output,omitempty"`
+
+	// NoVerdict is the streak of consecutive precondition or verify runs without a verdict that
+	// ends at this result, whatever their exit codes. It is set only for unknown results; a
+	// verdict, 0 or 1, ends the streak.
+	// +optional
+	NoVerdict *NoVerdict `json:"noVerdict,omitempty"`
+}
+
+// NoVerdict is a streak of consecutive runs of one script that gave no exit 0 or 1.
+type NoVerdict struct {
+	// Runs is how many runs the streak has.
+	// +kubebuilder:validation:Minimum=1
+	Runs int32 `json:"runs"`
+
+	// Since is when the first run of the streak ended.
+	Since metav1.Time `json:"since"`
+
+	// Last is when the latest run of the streak ended. A run that ended no later is not counted
+	// again.
+	Last metav1.Time `json:"last"`
 }
 
 // LastChecks holds the latest result of each script.
@@ -254,7 +311,7 @@ type LastChecks struct {
 
 // Resolution records how an incident ended.
 type Resolution struct {
-	// By is what ended it: verify (state Resolved) or user (state Closed).
+	// By is what ended it: verify (state Resolved), or user or alert-gone (state Closed).
 	By ResolvedBy `json:"by"`
 
 	// At is when it ended.
@@ -325,7 +382,7 @@ type AnalyzedResource struct {
 
 // IncidentStatus is the incident's lifecycle, its checks and its root-cause analysis.
 // +kubebuilder:validation:XValidation:rule="has(self.resolution) == (has(self.state) && self.state in ['Resolved', 'Closed'])",message="resolution is set exactly when state is Resolved or Closed"
-// +kubebuilder:validation:XValidation:rule="!has(self.resolution) || (has(self.state) && ((self.resolution.by == 'verify') == (self.state == 'Resolved')))",message="Resolved goes with resolution.by verify, Closed with resolution.by user"
+// +kubebuilder:validation:XValidation:rule="!has(self.resolution) || (has(self.state) && ((self.resolution.by == 'verify') == (self.state == 'Resolved')))",message="Resolved goes with resolution.by verify, Closed with resolution.by user or alert-gone"
 // +kubebuilder:validation:XValidation:rule="!has(oldSelf.state) || !(oldSelf.state in ['Resolved', 'Closed']) || (has(self.state) && (self.state == oldSelf.state || self.state == 'Closed'))",message="Resolved can only become Closed, and Closed is final"
 type IncidentStatus struct {
 	prv1.ConditionedStatus `json:",inline"`
@@ -339,7 +396,8 @@ type IncidentStatus struct {
 	HowToFix *HowToFix `json:"howToFix,omitempty"`
 
 	// LastChecks is the latest result of each script. It changes only when a result does, so a
-	// check that keeps giving the same result writes nothing.
+	// check that keeps giving the same verdict writes nothing; each unknown run is counted in its
+	// noVerdict streak, up to the bound that stops the script.
 	// +optional
 	LastChecks *LastChecks `json:"lastChecks,omitempty"`
 

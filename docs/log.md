@@ -12,6 +12,41 @@ timestamp: 2026-11-04T00:00:00Z
 Curated history — notable changes and decisions, newest first. Full release
 notes live in GitHub Releases. Entries record what was true when written.
 
+## 2026-11-09 — bounds for incidents that get no verdict (unreleased)
+
+On one cluster, incidents sat `Open` or `Verifying` for weeks. Three causes,
+all at 0.7.0: an unknown result (an exit other than `0`/`1`, or a timeout)
+moved nothing, ever, so a broken script parked its incident for good, in
+`Open` and in `Verifying`; a first precondition exit `0` flagged the incident
+and stopped the precondition until a human acted; and a precondition reading
+a deleted Alert exited `2` forever. Changed:
+- **No-verdict bound.** Each unknown run extends
+  `lastChecks.<script>.noVerdict`; a verdict ends it. At `noVerdictRuns` (6)
+  runs or after `noVerdictFor` (24h) the script stops and
+  `ChecksUnknown=True` carries the last exit code and output. Applies to the
+  precondition in `Open` and verify in `Verifying`. Apply stays human-only.
+- **Alert deleted.** While `Open` or `Verifying` the controller reads the
+  Alert in `spec.alertRef` once a poll interval. NotFound sets
+  `AlertGone=True`; after `alertGoneGrace` (10m) the incident is `Closed`
+  with the new `resolution.by: alert-gone`. `Closed`, not `Resolved`, since
+  nothing proved the problem gone. The controller needs `get` on `alerts`.
+- **First run exits `0`.** The incident moves to `Verifying` and verify
+  decides; `Reproduced=False` stays as a record. Incidents flagged by 0.7.0
+  run their precondition again.
+- **Signals.** `StateChanged` log lines carry `from`, `to`, `why`; new
+  `ChecksUnknown` and `AlertGone` Events and log lines.
+
+The CRD change is additive (`noVerdict`, the `alert-gone` enum value), but
+the CRD chart must be upgraded before the controller: the old enum rejects a
+status write with `alert-gone`, and the old schema prunes `noVerdict`.
+
+Not changed: the check-reader ClusterRole. The `nodes` failure seen on that
+cluster was a script calling `kubectl get nodes.core …`: kubectl does not
+resolve a `core` group suffix (`the server doesn't have a resource type
+"nodes"`), while the role, written from discovery, already grants
+`nodes`. Static rules in the chart would also be replaced wholesale on every
+helm upgrade, dropping the discovered ones until the next refresh.
+
 ## 2026-11-04 — provider-runtime v1.8.2: the Ready contract (unreleased)
 
 provider-runtime v1.8.0 (taken at v1.8.2) sets `Ready` to
