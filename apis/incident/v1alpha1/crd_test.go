@@ -205,7 +205,7 @@ func TestValidation(t *testing.T) {
 				status(obj)["resolution"].(map[string]any)["by"] = "user"
 				return obj
 			},
-			wantErr: "Resolved goes with resolution.by verify, Closed with resolution.by user",
+			wantErr: "Resolved goes with resolution.by verify, Closed with resolution.by user or alert-gone",
 		},
 		{
 			name: "Closed by verify",
@@ -214,7 +214,53 @@ func TestValidation(t *testing.T) {
 				status(obj)["resolution"].(map[string]any)["by"] = "verify"
 				return obj
 			},
-			wantErr: "Resolved goes with resolution.by verify, Closed with resolution.by user",
+			wantErr: "Resolved goes with resolution.by verify, Closed with resolution.by user or alert-gone",
+		},
+		{
+			name: "Closed by alert-gone",
+			obj: func(t *testing.T) map[string]any {
+				obj := withState(t, "Closed")
+				delete(spec(obj), "closed")
+				status(obj)["resolution"].(map[string]any)["by"] = "alert-gone"
+				return obj
+			},
+		},
+		{
+			name: "Resolved by alert-gone",
+			obj: func(t *testing.T) map[string]any {
+				obj := withState(t, "Resolved")
+				status(obj)["resolution"].(map[string]any)["by"] = "alert-gone"
+				return obj
+			},
+			wantErr: "Resolved goes with resolution.by verify, Closed with resolution.by user or alert-gone",
+		},
+		{
+			name: "a resolution outside the enum",
+			obj: func(t *testing.T) map[string]any {
+				obj := withState(t, "Closed")
+				status(obj)["resolution"].(map[string]any)["by"] = "timeout"
+				return obj
+			},
+			wantErr: `Unsupported value: "timeout"`,
+		},
+		{
+			name: "a no-verdict streak",
+			obj: func(t *testing.T) map[string]any {
+				obj := example(t)
+				lastChecks(obj)["verify"] = map[string]any{"exit": int64(2), "since": "2026-09-25T14:08:00Z",
+					"noVerdict": map[string]any{"runs": int64(3), "since": "2026-09-25T14:06:00Z", "last": "2026-09-25T14:08:00Z"}}
+				return obj
+			},
+		},
+		{
+			name: "a no-verdict streak without runs",
+			obj: func(t *testing.T) map[string]any {
+				obj := example(t)
+				lastChecks(obj)["verify"] = map[string]any{"exit": int64(2), "since": "2026-09-25T14:08:00Z",
+					"noVerdict": map[string]any{"runs": int64(0), "since": "2026-09-25T14:06:00Z", "last": "2026-09-25T14:08:00Z"}}
+				return obj
+			},
+			wantErr: "status.lastChecks.verify.noVerdict.runs: Invalid value",
 		},
 		{
 			name: "an exit code above 255",

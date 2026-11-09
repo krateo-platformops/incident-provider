@@ -61,15 +61,16 @@ Lifecycle and checks:
 | `howToFix.rollback` | string (bash) | writer | undoes apply; a human runs it to revert an applied fix. Never run by the controller, moves no state |
 | `lastChecks.precondition`, `.apply`, `.verify` | `{exit, since}` | controller | the latest result of each script. Moving back to `Open` drops the precondition result, entering `Verifying` the verify result: each describes a state that has moved on |
 | `lastChecks.*.exit` | int 0-255 | controller | the exit code; absent for a timeout, for a pod that never ran, and for the `apply` result that records a consumed `spec.applied`. An `apply` result from an IncidentApply run carries the run's exit |
-| `lastChecks.*.since` | date-time, required | controller | when the script started giving this result. A precondition or verify run with the same result leaves it, and the whole status, unchanged; every apply run sets it |
+| `lastChecks.*.since` | date-time, required | controller | when the script started giving this result. A precondition or verify run with the same result leaves it unchanged, and with the same verdict the whole status too; every apply run sets it |
 | `lastChecks.*.output` | string, at most 512 bytes | controller | for an unknown precondition or verify result only: what the run printed (the end of its log), or why it gave no exit code. Kept from the run that started giving the result |
+| `lastChecks.*.noVerdict` | `{runs, since, last}` | controller | for an unknown precondition or verify result only: the streak of consecutive runs without a verdict, whatever their exit codes; `runs` ≥ 1, `since` and `last` when its first and latest runs ended. Each unknown run extends it; a verdict ends it. See [the no-verdict bound](./overview.md#no-verdict) |
 | `verifyingSince` | date-time | controller | the start of the settle window: when the incident entered `Verifying`, or was applied again while `Verifying`. Set only while `Verifying` |
-| `resolution.by` | `verify` \| `user`, required | controller | `verify` with `Resolved`, `user` with `Closed` |
+| `resolution.by` | `verify` \| `user` \| `alert-gone`, required | controller | `verify` with `Resolved`; `user` or `alert-gone` with `Closed`. `alert-gone`: the Alert in `spec.alertRef` was deleted |
 | `resolution.at` | date-time, required | controller | when the incident ended |
-| `conditions[]` | provider-runtime `Condition` | controller | `Ready` and `Synced` from provider-runtime, plus `Reproduced` below |
+| `conditions[]` | provider-runtime `Condition` | controller | `Ready` and `Synced` from provider-runtime, plus `Reproduced`, `ChecksUnknown` and `AlertGone` below |
 
 Any other exit code, and a timeout, is unknown: it is recorded and changes no
-state.
+state; too many in a row stop the script (`ChecksUnknown`).
 
 The root-cause analysis, written by the writer:
 
@@ -99,9 +100,30 @@ The controller sets it on the first precondition run:
 | Status | Reason | Meaning |
 |---|---|---|
 | `True` | `PreconditionHolds` | the first run exited `1`: the script sees the incident |
-| `False` | `PreconditionPassed` | the first run exited `0`: the script cannot see the incident. The incident is flagged: it stays `Open`, its precondition no longer runs, and only `spec.applied` or `spec.closed` moves it |
+| `False` | `PreconditionPassed` | the first run exited `0`: the problem was gone by the first check. The incident moves to `Verifying` and verify decides |
 
-It is absent until the first run.
+It is a record: neither status stops a script. It is absent until the first
+run with a verdict.
+
+## The ChecksUnknown condition
+
+| Status | Reason | Meaning |
+|---|---|---|
+| `True` | `PreconditionNoVerdict` | the precondition gave no verdict for `noVerdictRuns` runs in a row or for `noVerdictFor`, so it no longer runs. The message has the run count, the last exit code and the start of the last output |
+| `True` | `VerifyNoVerdict` | the same for verify, while `Verifying` |
+| `False` | `ChecksResumed` | the script it named is no longer current: the state changed, a human applied again, or a reanalysis replaced the scripts |
+
+It is absent until a script hits the bound.
+
+## The AlertGone condition
+
+| Status | Reason | Meaning |
+|---|---|---|
+| `True` | `AlertNotFound` | the apiserver answered NotFound for the Alert in `spec.alertRef`. Once `True` for the alert-gone grace, the incident is `Closed` with `resolution.by: alert-gone` |
+| `False` | `AlertFound` | the Alert exists again |
+
+It is read only while `Open` or `Verifying`, and is absent while the Alert has
+always been found.
 
 ## Rules the apiserver enforces
 
@@ -110,7 +132,7 @@ It is absent until the first run.
 | `spec.alertRef` does not change | `alertRef is immutable` |
 | `spec.closed` stays `true` once set | `closed cannot be unset` |
 | `status.resolution` is set exactly when `state` is `Resolved` or `Closed` | `resolution is set exactly when state is Resolved or Closed` |
-| `Resolved` goes with `by: verify`, `Closed` with `by: user` | `Resolved goes with resolution.by verify, Closed with resolution.by user` |
+| `Resolved` goes with `by: verify`, `Closed` with `by: user` or `by: alert-gone` | `Resolved goes with resolution.by verify, Closed with resolution.by user or alert-gone` |
 | a `Resolved` incident only becomes `Closed`; a `Closed` one stays `Closed` | `Resolved can only become Closed, and Closed is final` |
 
 A writer's status patch that breaks a rule is rejected whole. In particular, a
@@ -149,5 +171,6 @@ reason `ApplyFinished`, its message starting with the phase
   `v1alpha1.IncidentList` its `resource.ManagedList`.
 - `v1alpha1.IncidentApply` satisfies `resource.Managed` too.
 - Constants: `RequesterPolicy`, `MaxApplyOutput`, `ReasonApplyFinished`, the `Apply*` phases, `LabelAlert`, the `State*`, `Script*`, `ResolvedBy*`,
-  `Trigger*` and `Source*` values, `TypeReproduced` and its reasons.
+  `Trigger*` and `Source*` values, `TypeReproduced`, `TypeChecksUnknown`, `TypeAlertGone` and
+  their reasons.
 - `apis.AddToScheme` registers the group.

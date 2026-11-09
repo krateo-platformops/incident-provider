@@ -12,8 +12,8 @@ timestamp: 2026-09-25T00:00:00Z
 An **Incident** is one occurrence of an Alert's problem, from its root-cause
 analysis to its end. An Alert (`alerts.observability.krateo.io`, owned by
 alert-provider) opens Incidents; it never closes them. Each Incident carries
-its own checks as bash scripts, and ends when a script proves the problem gone
-or a human closes it.
+its own checks as bash scripts, and ends when a script proves the problem gone,
+a human closes it, or its Alert is deleted.
 
 ## Who writes what
 
@@ -43,17 +43,19 @@ Analyzing ──▶ Open ◀──▶ Verifying ──▶ Resolved
    ▲           │            │
    └───────────┴────────────┘ spec.reanalysis
 any state ──spec.closed──▶ Closed
+Open, Verifying ──Alert deleted──▶ Closed
 ```
 
 | From | To | On |
 |---|---|---|
 | — | `Analyzing` | the writer's first status write |
 | `Analyzing` | `Open` | the analysis finished, or failed with `error` set |
-| `Open` | `Verifying` | precondition exit `0`; `spec.applied`, which the controller consumes: it records an `apply` result and sets `applied` back to `false`; or an IncidentApply run that exits `0` |
+| `Open` | `Verifying` | precondition exit `0`, the first run included; `spec.applied`, which the controller consumes: it records an `apply` result and sets `applied` back to `false`; or an IncidentApply run that exits `0` |
 | `Verifying` | `Resolved` | verify exit `0`, at any time |
 | `Verifying` | `Open` | verify exit `1` once the settle window has passed |
 | `Open`, `Verifying` | `Analyzing` | `spec.reanalysis`, which the writer consumes: it clears the analysis and the checks' results and runs the analysis again |
 | any | `Closed` | `spec.closed: true` |
+| `Open`, `Verifying` | `Closed` | the Alert in `spec.alertRef` NotFound for the alert-gone grace (10 minutes by default): `resolution.by: alert-gone` |
 
 The settle window (5 minutes by default) gives a fix time to take effect. It
 starts when the incident enters `Verifying` (`status.verifyingSince`): at the
@@ -65,13 +67,43 @@ human applying again while `Verifying`, or an IncidentApply run that exits `0`,
 restarts the window; a failed IncidentApply run is recorded but does not.
 
 `Resolved` means a script proved the problem gone; `Closed` means a person
-decided. `Closed` is final, and a `Resolved` incident can only become `Closed`.
+decided, or the Alert was deleted. `Closed` is final, and a `Resolved`
+incident can only become `Closed`.
 
-The first precondition run with a verdict must exit `1`; runs that end
-without `0` or `1` do not count. An exit `0` there means the script
-cannot see the problem, so the incident is flagged (`Reproduced=False`)
-instead of moving on: it stays `Open`, its precondition no longer runs, and
-only `spec.applied` (then verify) or `spec.closed` moves it.
+The first precondition run with a verdict sets `Reproduced`: `True` on exit
+`1`, `False` on exit `0`. An exit `0` there means the problem was gone by the
+first check: the incident moves to `Verifying` like any other precondition
+exit `0`, and verify decides. Verify exit `0` resolves it; exit `1` after the
+settle window sends it back to `Open`, where the precondition runs again.
+`Reproduced=False` stays as a record. (Up to 0.7.0 such an incident was
+flagged: it stayed `Open` with its precondition stopped until a human acted.
+An incident flagged that way runs its precondition again.)
+
+### No verdict
+
+A precondition or verify run that exits other than `0` or `1`, or times out,
+gives no verdict and moves no state. Each such run extends the script's
+streak, `lastChecks.<script>.noVerdict` (`runs`, `since`, `last`); a verdict
+ends it. When the streak reaches `noVerdictRuns` runs (6 by default) or lasts
+`noVerdictFor` (24 hours by default), the script stops and the incident gets
+`ChecksUnknown=True`, reason `PreconditionNoVerdict` (`Open`) or
+`VerifyNoVerdict` (`Verifying`), whose message carries the run count, the last
+exit code and the start of the last output. The incident stays in its state:
+stuck is now visible, not silent. `spec.applied`, `spec.closed`,
+`spec.reanalysis` (new scripts) or an IncidentApply run that exits `0` moves
+it; the condition then turns `False`, reason `ChecksResumed`. An unknown
+result recorded by 0.7.0 or earlier starts its streak at its `since`, so an incident
+stuck for longer than `noVerdictFor` stops at its next run.
+
+### Alert deleted
+
+While `Open` or `Verifying`, the controller reads the Alert in
+`spec.alertRef` once a poll interval. A NotFound that names the Alert sets
+`AlertGone=True`; the Alert found again sets it `False`. Once `AlertGone` has
+been `True` for the alert-gone grace, the incident is `Closed` with
+`resolution.by: alert-gone`. `Closed`, not `Resolved`: nothing proved the
+problem gone. A missing Alert CRD, a denied read or an unreachable apiserver
+change nothing.
 
 A failed analysis leaves the incident `Open` with `error` set; a human can
 close it. An incident with no `howToFix` scripts gets no checks run.
@@ -88,7 +120,8 @@ close it. An incident with no `howToFix` scripts gets no checks run.
 | `rollback` | a human, to undo apply | when an applied fix must be reverted; it moves no state |
 
 Exit `0` means the incident is gone, `1` that it holds; any other exit, or a
-timeout, is unknown and changes no state. The precondition tests the
+timeout, is unknown and changes no state, up to the [no-verdict
+bound](#no-verdict). The precondition tests the
 root-cause object, never the alert's rows, so it still reports the right
 answer when the alert fires for another reason.
 
@@ -102,7 +135,7 @@ run's result is read.
 
 | provider-runtime | incident-provider |
 |---|---|
-| `ExternalClient.Observe` | reads the incident's check pods; records a finished one in `status.lastChecks` and applies its transition; applies `spec.closed` and `spec.applied`. A status to persist, a check pod to delete or a check that is due make the Incident out of date. It changes nothing but the Incident held in memory |
+| `ExternalClient.Observe` | reads the incident's check pods; records a finished one in `status.lastChecks` and applies its transition; applies `spec.closed` and `spec.applied`; reads the incident's Alert once a poll interval while `Open` or `Verifying`. A status to persist, a check pod to delete or a check that is due make the Incident out of date. It changes nothing but the Incident held in memory |
 | `Create` | never called |
 | `Update` | persists the status when it changed, then sets `spec.applied` back to `false`, deletes finished and stale check pods, and starts the next check when it is due: precondition when `Open`, verify when `Verifying` |
 | `Delete` + finalizer | the Incident is deleted: removes its check pods and ConfigMaps |
@@ -132,12 +165,31 @@ was applied or closed meanwhile) is deleted and its result dropped.
 ### Writes
 
 `status.lastChecks` keeps one result per script, with `since`: when the script
-started giving it. A precondition or verify run that gives the same result as
+started giving it. A precondition or verify run that gives the same verdict as
 the last leaves the status as it is, so the controller writes nothing. An Open
 incident whose precondition keeps exiting `1` is not written to until the
 result changes, a human acts, or it is closed; a watcher of Incidents sees no
 event from it. A result that changes, a transition, and every apply run are
-one status write each.
+one status write each. An unknown run is one too, since it extends the
+no-verdict streak; the bound caps them.
+
+### Signals
+
+Every transition and condition change the controller makes is a Kubernetes
+Event on the Incident and an INFO log line (`service.name: incident-provider`)
+with the attributes `incident` (`namespace/name`) and `reason`:
+
+| `reason` | Attributes | When |
+|---|---|---|
+| `StateChanged` | `from`, `to`, `why` | every state transition the controller makes; the message is `‹from› -> ‹to›: ‹why›` |
+| `ChecksUnknown` | `state`, `script`, `exit`, `runs` | a script hit the no-verdict bound and stopped |
+| `AlertGone` | `state`, `alert` | the Alert in `spec.alertRef` was first found missing |
+
+To alert on stuck incidents, match `ChecksUnknown=True` on the Incident, or
+the `ChecksUnknown` log line; for incidents left `Open` too long, compare the
+time of the last `StateChanged` with `to: Open` (or the Incident's
+`creationTimestamp`) with now. The writer's transitions (`Analyzing`, then
+`Open`) are logged by alert-provider, not here.
 
 ## Run apply
 

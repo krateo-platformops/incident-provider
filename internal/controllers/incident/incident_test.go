@@ -3,6 +3,7 @@ package incident
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -11,6 +12,7 @@ import (
 	"github.com/google/go-cmp/cmp"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
@@ -119,7 +121,7 @@ func kindOf(o client.Object) string {
 
 func newExternal(k *kube, now time.Time) *external {
 	return &external{
-		kube: k, cfg: cfg, pods: pods, runs: newLastRuns(),
+		kube: k, cfg: cfg, pods: pods, runs: newLastRuns(), alertReads: newLastRuns(),
 		log: logging.NewNopLogger(), rec: event.NewNopRecorder(),
 		now: func() time.Time { return now },
 	}
@@ -259,11 +261,44 @@ func TestObserve(t *testing.T) {
 			wantCalls: []string{"update status", "delete pod check-0b7c3a3e1d2f-precondition-0"},
 		},
 		{
-			name: "a flagged incident runs no precondition",
-			inc:  newIncident(v1alpha1.StateOpen, withReproduced(metav1.ConditionFalse)),
-			want: reconciler.ExternalObservation{ResourceExists: true, ResourceUpToDate: true},
-			// Nothing to create: the precondition no longer runs.
+			name:      "an incident flagged by an earlier version runs its precondition again",
+			inc:       newIncident(v1alpha1.StateOpen, withReproduced(metav1.ConditionFalse)),
+			want:      reconciler.ExternalObservation{ResourceExists: true, ResourceUpToDate: false},
 			wantState: v1alpha1.StateOpen,
+			wantCalls: []string{
+				"create pod check-0b7c3a3e1d2f-precondition-0",
+				"create configmap check-0b7c3a3e1d2f-precondition-0",
+			},
+		},
+		{
+			name: "a stopped precondition runs no check",
+			inc:  open(stoppedOn(v1alpha1.ScriptPrecondition)),
+			want: reconciler.ExternalObservation{ResourceExists: true, ResourceUpToDate: true},
+			// Nothing to create: the precondition hit the no-verdict bound.
+			wantState: v1alpha1.StateOpen,
+		},
+		{
+			name: "the run that hits the no-verdict bound is persisted, and no next run starts",
+			inc:  open(withLastChecks(v1alpha1.LastChecks{Precondition: streakOf(lc(exit(2), 4*time.Minute), 5, 4*time.Minute, 7*time.Minute)})),
+			pods: func(inc *v1alpha1.Incident) []corev1.Pod {
+				return []corev1.Pod{checkPod(inc, v1alpha1.ScriptPrecondition, now.Add(-3*time.Minute), exit(2), now.Add(-2*time.Minute))}
+			},
+			want:      reconciler.ExternalObservation{ResourceExists: true, ResourceUpToDate: false},
+			wantState: v1alpha1.StateOpen,
+			wantStale: 1,
+			wantCalls: []string{"update status", "delete pod check-0b7c3a3e1d2f-precondition-0"},
+		},
+		{
+			name: "a ChecksUnknown left from before a reanalysis is cleared and the new precondition runs",
+			inc:  open(withChecksUnknown(v1alpha1.ReasonPreconditionNoVerdict)),
+			want: reconciler.ExternalObservation{ResourceExists: true, ResourceUpToDate: false},
+			// The condition is a status change: written before the check starts.
+			wantState: v1alpha1.StateOpen,
+			wantCalls: []string{
+				"update status",
+				"create pod check-0b7c3a3e1d2f-precondition-0",
+				"create configmap check-0b7c3a3e1d2f-precondition-0",
+			},
 		},
 		{
 			name:      "an incident without scripts runs no check",
@@ -280,6 +315,7 @@ func TestObserve(t *testing.T) {
 			}
 			k := newKube(p...)
 			e := newExternal(k, now)
+			e.cfg.NoVerdictRuns = 6
 			if !tc.lastRun.IsZero() {
 				e.runs.seen(tc.inc.UID, tc.lastRun)
 			}
@@ -710,5 +746,83 @@ func TestPodPassesRestrictedPodSecurity(t *testing.T) {
 	lv := psaapi.LevelVersion{Level: psaapi.LevelRestricted, Version: psaapi.LatestVersion()}
 	if r := policy.AggregateCheckResults(evaluator.EvaluatePod(lv, &p.ObjectMeta, &p.Spec)); !r.Allowed {
 		t.Errorf("the check pod violates restricted: %s", r.ForbiddenDetail())
+	}
+}
+
+// alertReader answers every Alert read with err.
+type alertReader struct {
+	client.Reader
+	err   error
+	reads int
+}
+
+func (a *alertReader) Get(_ context.Context, key client.ObjectKey, o client.Object, _ ...client.GetOption) error {
+	a.reads++
+	if gvk := o.GetObjectKind().GroupVersionKind(); gvk != AlertGroupVersionKind || key.Name != "cd-not-ready" || key.Namespace != "krateo-system" {
+		return fmt.Errorf("unexpected read of %s %s", gvk, key)
+	}
+	return a.err
+}
+
+func TestObserveReadsAlert(t *testing.T) {
+	now := t0.Add(10 * time.Minute)
+	notFound := apierrors.NewNotFound(schema.GroupResource{Group: "observability.krateo.io", Resource: "alerts"}, "cd-not-ready")
+	// The apiserver's answer for a resource type it does not serve names no object.
+	noResource := apierrors.NewNotFound(schema.GroupResource{}, "")
+	noKind := &apimeta.NoKindMatchError{GroupKind: AlertGroupVersionKind.GroupKind(), SearchedVersions: []string{"v1alpha1"}}
+
+	cases := []struct {
+		name          string
+		inc           *v1alpha1.Incident
+		err           error
+		lastRead      time.Time
+		wantReads     int
+		wantAlertGone metav1.ConditionStatus
+		wantState     v1alpha1.State
+		wantWrite     bool
+	}{
+		{name: "found", inc: newIncident(v1alpha1.StateOpen), wantReads: 1,
+			wantAlertGone: metav1.ConditionUnknown, wantState: v1alpha1.StateOpen},
+		{name: "NotFound naming the Alert: AlertGone, written", inc: newIncident(v1alpha1.StateOpen), err: notFound, wantReads: 1,
+			wantAlertGone: metav1.ConditionTrue, wantState: v1alpha1.StateOpen, wantWrite: true},
+		{name: "NotFound for the grace: Closed", inc: newIncident(v1alpha1.StateVerifying, withVerifyingSince(0), withAlertGone(0)), err: notFound, wantReads: 1,
+			wantAlertGone: metav1.ConditionTrue, wantState: v1alpha1.StateClosed, wantWrite: true},
+		{name: "NotFound for the resource type: unread", inc: newIncident(v1alpha1.StateOpen), err: noResource, wantReads: 1,
+			wantAlertGone: metav1.ConditionUnknown, wantState: v1alpha1.StateOpen},
+		{name: "no Alert CRD: unread", inc: newIncident(v1alpha1.StateOpen), err: noKind, wantReads: 1,
+			wantAlertGone: metav1.ConditionUnknown, wantState: v1alpha1.StateOpen},
+		{name: "forbidden: unread", inc: newIncident(v1alpha1.StateOpen), err: apierrors.NewForbidden(schema.GroupResource{Resource: "alerts"}, "cd-not-ready", errors.New("no")), wantReads: 1,
+			wantAlertGone: metav1.ConditionUnknown, wantState: v1alpha1.StateOpen},
+		{name: "read less than a poll interval ago: not read", inc: newIncident(v1alpha1.StateOpen), err: notFound, lastRead: now.Add(-30 * time.Second),
+			wantAlertGone: metav1.ConditionUnknown, wantState: v1alpha1.StateOpen},
+		{name: "Analyzing: not read", inc: newIncident(v1alpha1.StateAnalyzing), err: notFound,
+			wantAlertGone: metav1.ConditionUnknown, wantState: v1alpha1.StateAnalyzing},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			k := newKube()
+			e := newExternal(k, now)
+			e.cfg.AlertGoneGrace = 10 * time.Minute
+			a := &alertReader{err: tc.err}
+			e.alerts = a
+			if !tc.lastRead.IsZero() {
+				e.alertReads.seen(tc.inc.UID, tc.lastRead)
+			}
+			if _, err := e.Observe(context.Background(), tc.inc); err != nil {
+				t.Fatal(err)
+			}
+			if a.reads != tc.wantReads {
+				t.Errorf("Alert reads = %d, want %d", a.reads, tc.wantReads)
+			}
+			if s := tc.inc.GetCondition(v1alpha1.TypeAlertGone).Status; s != tc.wantAlertGone {
+				t.Errorf("AlertGone = %s, want %s", s, tc.wantAlertGone)
+			}
+			if tc.inc.Status.State != tc.wantState {
+				t.Errorf("state = %s, want %s", tc.inc.Status.State, tc.wantState)
+			}
+			if e.plan.dirty != tc.wantWrite {
+				t.Errorf("status write = %v, want %v", e.plan.dirty, tc.wantWrite)
+			}
+		})
 	}
 }

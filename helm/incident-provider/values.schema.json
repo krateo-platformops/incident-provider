@@ -36,6 +36,9 @@
         "debug": { "type": "boolean" },
         "pollInterval": { "type": "string", "pattern": "^[0-9]+(ns|us|ms|s|m|h)$" },
         "settleWindow": { "type": "string", "pattern": "^[0-9]+(ns|us|ms|s|m|h)$" },
+        "noVerdictRuns": { "type": "integer", "minimum": 0, "maximum": 2147483647, "description": "Consecutive runs without exit 0 or 1 that stop the current script; 0 disables." },
+        "noVerdictFor": { "type": "string", "pattern": "^[0-9]+(ns|us|ms|s|m|h)$", "description": "How long runs may give no exit 0 or 1 before the current script stops; 0s disables." },
+        "alertGoneGrace": { "type": "string", "pattern": "^[0-9]+(ns|us|ms|s|m|h)$", "description": "How long the Alert must stay NotFound before an Open or Verifying incident is closed by alert-gone." },
         "syncPeriod": { "type": "string", "pattern": "^[0-9]+(ns|us|ms|s|m|h)$" },
         "maxReconcileRate": { "type": "integer", "minimum": 1 },
         "leaderElection": { "type": "boolean" }
