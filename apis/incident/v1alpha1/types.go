@@ -8,6 +8,14 @@ import (
 	"github.com/krateo-platformops/provider-runtime/pkg/resource"
 )
 
+// AnnotationClosedReason, on an incident the writer (alert-provider) closed, says why. The writer
+// sets it in the same object write as spec.closed. ClosedReasonAnalysisFailed: the root-cause
+// analysis finally failed and gave no scripts that can run.
+const (
+	AnnotationClosedReason     = "observability.krateo.io/closed-reason"
+	ClosedReasonAnalysisFailed = "analysis-failed"
+)
+
 // LabelAlert carries the name of the Alert that opened an Incident. Writers set it at creation,
 // with the value of spec.alertRef.name, so one alert's incidents list with a label selector in the
 // alert's namespace.
@@ -28,8 +36,8 @@ const (
 	StateVerifying State = "Verifying"
 	// StateResolved: the verify script exited 0.
 	StateResolved State = "Resolved"
-	// StateClosed: a human closed the incident, or the controller did because its Alert was
-	// deleted.
+	// StateClosed: a human closed the incident, the writer did because its analysis failed, or
+	// the controller did because its Alert was deleted.
 	StateClosed State = "Closed"
 )
 
@@ -55,7 +63,7 @@ const (
 )
 
 // ResolvedBy is what ended an incident.
-// +kubebuilder:validation:Enum=verify;user;alert-gone
+// +kubebuilder:validation:Enum=verify;user;alert-gone;analysis-failed
 type ResolvedBy string
 
 const (
@@ -66,6 +74,10 @@ const (
 	// ResolvedByAlertGone: the Alert in spec.alertRef was deleted, and stayed deleted for the
 	// alert-gone grace. Goes with state Closed: nothing proved the problem gone.
 	ResolvedByAlertGone ResolvedBy = "alert-gone"
+	// ResolvedByAnalysisFailed: the writer closed the incident because its root-cause analysis
+	// failed: spec.closed with the closed-reason annotation analysis-failed, both written by the
+	// writer (see closedBy in the controller). Goes with state Closed: nothing was checked.
+	ResolvedByAnalysisFailed ResolvedBy = "analysis-failed"
 )
 
 // SourceType is the kind of a piece of evidence.
@@ -162,7 +174,8 @@ type IncidentSpec struct {
 	// +optional
 	Applied bool `json:"applied,omitempty"`
 
-	// Closed says a human closed the incident. It moves any state to Closed and cannot be unset.
+	// Closed says a human closed the incident, or the writer did because its analysis failed (with
+	// the closed-reason annotation). It moves any state to Closed and cannot be unset.
 	// +optional
 	Closed bool `json:"closed,omitempty"`
 
@@ -311,7 +324,8 @@ type LastChecks struct {
 
 // Resolution records how an incident ended.
 type Resolution struct {
-	// By is what ended it: verify (state Resolved), or user or alert-gone (state Closed).
+	// By is what ended it: verify (state Resolved), or user, alert-gone or analysis-failed (state
+	// Closed).
 	By ResolvedBy `json:"by"`
 
 	// At is when it ended.
@@ -382,7 +396,7 @@ type AnalyzedResource struct {
 
 // IncidentStatus is the incident's lifecycle, its checks and its root-cause analysis.
 // +kubebuilder:validation:XValidation:rule="has(self.resolution) == (has(self.state) && self.state in ['Resolved', 'Closed'])",message="resolution is set exactly when state is Resolved or Closed"
-// +kubebuilder:validation:XValidation:rule="!has(self.resolution) || (has(self.state) && ((self.resolution.by == 'verify') == (self.state == 'Resolved')))",message="Resolved goes with resolution.by verify, Closed with resolution.by user or alert-gone"
+// +kubebuilder:validation:XValidation:rule="!has(self.resolution) || (has(self.state) && ((self.resolution.by == 'verify') == (self.state == 'Resolved')))",message="Resolved goes with resolution.by verify, Closed with resolution.by user, alert-gone or analysis-failed"
 // +kubebuilder:validation:XValidation:rule="!has(oldSelf.state) || !(oldSelf.state in ['Resolved', 'Closed']) || (has(self.state) && (self.state == oldSelf.state || self.state == 'Closed'))",message="Resolved can only become Closed, and Closed is final"
 type IncidentStatus struct {
 	prv1.ConditionedStatus `json:",inline"`

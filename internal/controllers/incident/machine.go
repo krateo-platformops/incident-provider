@@ -1,6 +1,7 @@
 package incident
 
 import (
+	"encoding/json"
 	"fmt"
 	"strings"
 	"time"
@@ -295,7 +296,7 @@ func applySpec(inc *v1alpha1.Incident, now time.Time) (changes []change, consume
 			return nil, false
 		}
 		c := setState(inc, v1alpha1.StateClosed, "spec.closed", now)
-		inc.Status.Resolution = &v1alpha1.Resolution{By: v1alpha1.ResolvedByUser, At: metav1.NewTime(now).Rfc3339Copy()}
+		inc.Status.Resolution = &v1alpha1.Resolution{By: closedBy(inc), At: metav1.NewTime(now).Rfc3339Copy()}
 		return []change{c}, false
 	}
 	if !inc.Spec.Applied {
@@ -313,6 +314,74 @@ func applySpec(inc *v1alpha1.Incident, now time.Time) (changes []change, consume
 	}
 	// Analyzing has no fix to apply yet; Resolved and Closed are over.
 	return nil, false
+}
+
+// closedBy is who set spec.closed: analysis-failed when the writer closed the incident because its
+// analysis failed, user otherwise.
+//
+// The writer closes a failed analysis with one object patch that sets spec.closed and the
+// closed-reason annotation analysis-failed. The annotation alone does not say who closed: a person
+// may close an incident that carries it (one copied from another incident, or one the writer
+// annotated in a race with the person's close). So the annotation counts only when the field
+// managers that own spec.closed in metadata.managedFields all own the annotation too: whoever set
+// closed also set the reason, in the same write or after an earlier one. The apiserver gives a
+// field to the manager of the write that changed it, so a person's close is owned by their client
+// (kubectl-edit, the portal's), and the writer's later patch of the same value takes nothing from
+// it. Without managedFields that name an owner of spec.closed the answer is user, as before
+// analysis-failed existed.
+//
+// Field managers are names clients choose, not identities: a person who sets both fields with the
+// writer's manager name is recorded as analysis-failed. resolution.by is a record, not a grant,
+// and anyone who may write spec.closed may close the incident anyway.
+func closedBy(inc *v1alpha1.Incident) v1alpha1.ResolvedBy {
+	if inc.GetAnnotations()[v1alpha1.AnnotationClosedReason] != v1alpha1.ClosedReasonAnalysisFailed {
+		return v1alpha1.ResolvedByUser
+	}
+	closers := owners(inc, "f:spec", "f:closed")
+	if len(closers) == 0 {
+		return v1alpha1.ResolvedByUser
+	}
+	reasoners := owners(inc, "f:metadata", "f:annotations", "f:"+v1alpha1.AnnotationClosedReason)
+	for m := range closers {
+		if !reasoners[m] {
+			return v1alpha1.ResolvedByUser
+		}
+	}
+	return v1alpha1.ResolvedByAnalysisFailed
+}
+
+// owners is the set of field managers whose managedFields entry on the main resource (not a
+// subresource) owns the field at path, a path of FieldsV1 keys.
+func owners(inc *v1alpha1.Incident, path ...string) map[string]bool {
+	out := map[string]bool{}
+	for _, e := range inc.GetManagedFields() {
+		if e.Subresource != "" || e.FieldsV1 == nil || e.FieldsType != "FieldsV1" {
+			continue
+		}
+		var f map[string]json.RawMessage
+		if json.Unmarshal(e.FieldsV1.Raw, &f) != nil {
+			continue
+		}
+		owned := true
+		for i, k := range path {
+			raw, ok := f[k]
+			if !ok {
+				owned = false
+				break
+			}
+			if i < len(path)-1 {
+				f = nil
+				if json.Unmarshal(raw, &f) != nil {
+					owned = false
+					break
+				}
+			}
+		}
+		if owned {
+			out[e.Manager] = true
+		}
+	}
+	return out
 }
 
 // record sets a finished run of the current script as its latest result and applies its

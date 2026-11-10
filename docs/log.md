@@ -4,13 +4,36 @@ title: incident-provider — log
 description: Curated chronological history of incident-provider — notable changes and decisions, newest first.
 resource: github.com/krateo-platformops/incident-provider
 tags: [controller, history]
-timestamp: 2026-11-04T00:00:00Z
+timestamp: 2026-11-10T00:00:00Z
 ---
 
 # Log
 
 Curated history — notable changes and decisions, newest first. Full release
 notes live in GitHub Releases. Entries record what was true when written.
+
+## 2026-11-10 — `resolution.by: analysis-failed` (unreleased)
+
+alert-provider now closes an incident whose analysis finally failed:
+`spec.closed: true` and the annotation
+`observability.krateo.io/closed-reason: analysis-failed`, in one patch.
+incident-provider recorded every `spec.closed` as `resolution.by: user`, and
+the portal shows that as closed by a person. Changed:
+- **New `resolution.by: analysis-failed`** (additive enum value), with
+  `Closed`. The controller sets it when the annotation is present with that
+  value and the field managers that own `spec.closed` all own the annotation
+  too; any other `spec.closed` stays `user`.
+- **Why managedFields.** The annotation alone would turn a person's Close
+  into `analysis-failed` whenever the incident carries it: a Close racing the
+  writer's patch (the writer's patch of an unchanged `closed` takes no
+  ownership, so the person keeps it), or a copied manifest. Field managers are
+  client-chosen names, not identities; a person who writes both fields in one
+  write is recorded as `analysis-failed`. Accepted: `resolution.by` is a
+  record, and whoever may write `spec.closed` may close anyway. With no
+  owner of `spec.closed` in `managedFields`, the answer is `user`.
+
+As with `alert-gone`, the CRD chart must be upgraded before the controller:
+the old enum rejects a status write with `analysis-failed`.
 
 ## 2026-11-09 — bounds for incidents that get no verdict (unreleased)
 

@@ -45,7 +45,7 @@ kubectl get incidents -n krateo-system -l observability.krateo.io/alert=composit
 | `prompt` | string | writer | the root-cause-analysis prompt sent to incident-agent |
 | `triggeredAt` | date-time | writer | when the opening firing arrived |
 | `applied` | bool | human: "I applied it", or the portal's Apply; reset by the controller | the apply script ran. The controller consumes it: it moves Open to Verifying, records an `apply` result and sets `applied` back to `false` |
-| `closed` | bool | human: the portal's Close | moves any state to Closed |
+| `closed` | bool | human: the portal's Close; the writer, closing a failed analysis | moves any state to Closed. The writer sets it with the annotation `observability.krateo.io/closed-reason: analysis-failed` in one patch (see `resolution.by`) |
 | `reanalysis` | `{feedback}` | human: the portal's Re-run analysis; removed by the writer | asks for a new analysis of an `Open` or `Verifying` incident. The writer consumes it: it records it in `status.reanalysis`, moves the incident back to `Analyzing`, removes the field and runs the analysis again with the previous one, the checks' results and `feedback` (at most 2000 characters). In any other state it is removed unanswered |
 
 ## status
@@ -65,7 +65,7 @@ Lifecycle and checks:
 | `lastChecks.*.output` | string, at most 512 bytes | controller | for an unknown precondition or verify result only: what the run printed (the end of its log), or why it gave no exit code. Kept from the run that started giving the result |
 | `lastChecks.*.noVerdict` | `{runs, since, last}` | controller | for an unknown precondition or verify result only: the streak of consecutive runs without a verdict, whatever their exit codes; `runs` ≥ 1, `since` and `last` when its first and latest runs ended. Each unknown run extends it; a verdict ends it. See [the no-verdict bound](./overview.md#no-verdict) |
 | `verifyingSince` | date-time | controller | the start of the settle window: when the incident entered `Verifying`, or was applied again while `Verifying`. Set only while `Verifying` |
-| `resolution.by` | `verify` \| `user` \| `alert-gone`, required | controller | `verify` with `Resolved`; `user` or `alert-gone` with `Closed`. `alert-gone`: the Alert in `spec.alertRef` was deleted |
+| `resolution.by` | `verify` \| `user` \| `alert-gone` \| `analysis-failed`, required | controller | `verify` with `Resolved`; `user`, `alert-gone` or `analysis-failed` with `Closed`. `alert-gone`: the Alert in `spec.alertRef` was deleted. `analysis-failed`: the writer closed the incident because its analysis failed: `spec.closed` carries the annotation `observability.krateo.io/closed-reason: analysis-failed`, and the field managers that own `spec.closed` all own that annotation too (see [overview](./overview.md#closed-by-the-writer)). Any other `spec.closed` is `user` |
 | `resolution.at` | date-time, required | controller | when the incident ended |
 | `conditions[]` | provider-runtime `Condition` | controller | `Ready` and `Synced` from provider-runtime, plus `Reproduced`, `ChecksUnknown` and `AlertGone` below |
 
@@ -132,7 +132,7 @@ always been found.
 | `spec.alertRef` does not change | `alertRef is immutable` |
 | `spec.closed` stays `true` once set | `closed cannot be unset` |
 | `status.resolution` is set exactly when `state` is `Resolved` or `Closed` | `resolution is set exactly when state is Resolved or Closed` |
-| `Resolved` goes with `by: verify`, `Closed` with `by: user` or `by: alert-gone` | `Resolved goes with resolution.by verify, Closed with resolution.by user or alert-gone` |
+| `Resolved` goes with `by: verify`, `Closed` with `by: user`, `by: alert-gone` or `by: analysis-failed` | `Resolved goes with resolution.by verify, Closed with resolution.by user, alert-gone or analysis-failed` |
 | a `Resolved` incident only becomes `Closed`; a `Closed` one stays `Closed` | `Resolved can only become Closed, and Closed is final` |
 
 A writer's status patch that breaks a rule is rejected whole. In particular, a

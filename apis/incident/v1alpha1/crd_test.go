@@ -205,7 +205,7 @@ func TestValidation(t *testing.T) {
 				status(obj)["resolution"].(map[string]any)["by"] = "user"
 				return obj
 			},
-			wantErr: "Resolved goes with resolution.by verify, Closed with resolution.by user or alert-gone",
+			wantErr: "Resolved goes with resolution.by verify, Closed with resolution.by user, alert-gone or analysis-failed",
 		},
 		{
 			name: "Closed by verify",
@@ -214,7 +214,7 @@ func TestValidation(t *testing.T) {
 				status(obj)["resolution"].(map[string]any)["by"] = "verify"
 				return obj
 			},
-			wantErr: "Resolved goes with resolution.by verify, Closed with resolution.by user or alert-gone",
+			wantErr: "Resolved goes with resolution.by verify, Closed with resolution.by user, alert-gone or analysis-failed",
 		},
 		{
 			name: "Closed by alert-gone",
@@ -232,7 +232,25 @@ func TestValidation(t *testing.T) {
 				status(obj)["resolution"].(map[string]any)["by"] = "alert-gone"
 				return obj
 			},
-			wantErr: "Resolved goes with resolution.by verify, Closed with resolution.by user or alert-gone",
+			wantErr: "Resolved goes with resolution.by verify, Closed with resolution.by user, alert-gone or analysis-failed",
+		},
+		{
+			name: "Closed by analysis-failed",
+			obj: func(t *testing.T) map[string]any {
+				obj := withState(t, "Closed")
+				obj["metadata"].(map[string]any)["annotations"] = map[string]any{v1alpha1.AnnotationClosedReason: v1alpha1.ClosedReasonAnalysisFailed}
+				status(obj)["resolution"].(map[string]any)["by"] = "analysis-failed"
+				return obj
+			},
+		},
+		{
+			name: "Resolved by analysis-failed",
+			obj: func(t *testing.T) map[string]any {
+				obj := withState(t, "Resolved")
+				status(obj)["resolution"].(map[string]any)["by"] = "analysis-failed"
+				return obj
+			},
+			wantErr: "Resolved goes with resolution.by verify, Closed with resolution.by user, alert-gone or analysis-failed",
 		},
 		{
 			name: "a resolution outside the enum",
@@ -360,6 +378,16 @@ func TestValidation(t *testing.T) {
 			wantErr: "Resolved can only become Closed, and Closed is final",
 		},
 		{
+			name: "Closed by analysis-failed is final",
+			old: func(t *testing.T) map[string]any {
+				obj := withState(t, "Closed")
+				status(obj)["resolution"].(map[string]any)["by"] = "analysis-failed"
+				return obj
+			},
+			obj:     func(t *testing.T) map[string]any { return withState(t, "Open") },
+			wantErr: "Resolved can only become Closed, and Closed is final",
+		},
+		{
 			name: "a Closed incident keeps its state",
 			old:  func(t *testing.T) map[string]any { return withState(t, "Closed") },
 			obj: func(t *testing.T) map[string]any {
@@ -444,6 +472,13 @@ func TestConstantsMatchCRD(t *testing.T) {
 	}
 	if d := cmp.Diff(states, enum(st.Properties["state"])); d != "" {
 		t.Errorf("status.state enum differs from the State constants (-want +got):\n%s", d)
+	}
+	resolvedBy := []string{
+		string(v1alpha1.ResolvedByVerify), string(v1alpha1.ResolvedByUser), string(v1alpha1.ResolvedByAlertGone),
+		string(v1alpha1.ResolvedByAnalysisFailed),
+	}
+	if d := cmp.Diff(resolvedBy, enum(st.Properties["resolution"].Properties["by"])); d != "" {
+		t.Errorf("status.resolution.by enum differs from the ResolvedBy constants (-want +got):\n%s", d)
 	}
 	var scripts []string
 	for k := range st.Properties["lastChecks"].Properties {
