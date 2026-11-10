@@ -112,6 +112,7 @@ func TestApplySpec(t *testing.T) {
 	now := t0.Add(10 * time.Minute)
 	nowT := ptr.To(metav1.NewTime(now))
 	closedBy := &v1alpha1.Resolution{By: v1alpha1.ResolvedByUser, At: metav1.NewTime(now)}
+	failedBy := &v1alpha1.Resolution{By: v1alpha1.ResolvedByAnalysisFailed, At: metav1.NewTime(now)}
 	pre1 := lc(exit(1), 0)
 	applyNow := lc(nil, 10*time.Minute)
 
@@ -134,6 +135,24 @@ func TestApplySpec(t *testing.T) {
 		}), want: want{state: v1alpha1.StateClosed, resolution: closedBy, reproduced: metav1.ConditionUnknown}},
 		{name: "closed wins over applied", inc: newIncident(v1alpha1.StateOpen, withSpec(true, true)),
 			want: want{state: v1alpha1.StateClosed, resolution: closedBy, reproduced: metav1.ConditionUnknown}},
+		{name: "closed by the writer as a failed analysis: analysis-failed", inc: newIncident(v1alpha1.StateAnalyzing,
+			closedWith(v1alpha1.ClosedReasonAnalysisFailed, entry(writerManager, "", fieldsClosedReason))),
+			want: want{state: v1alpha1.StateClosed, resolution: failedBy, reproduced: metav1.ConditionUnknown}},
+		{name: "closed by a person on an incident the writer annotated: user", inc: newIncident(v1alpha1.StateOpen,
+			closedWith(v1alpha1.ClosedReasonAnalysisFailed, entry(writerManager, "", fieldsReason), entry(personManager, "", fieldsClosed))),
+			want: want{state: v1alpha1.StateClosed, resolution: closedBy, reproduced: metav1.ConditionUnknown}},
+		{name: "Closed is final: a later analysis-failed close changes nothing", inc: newIncident(v1alpha1.StateClosed,
+			closedWith(v1alpha1.ClosedReasonAnalysisFailed, entry(writerManager, "", fieldsClosedReason)),
+			func(i *v1alpha1.Incident) {
+				i.Status.Resolution = &v1alpha1.Resolution{By: v1alpha1.ResolvedByUser, At: at(0)}
+			}),
+			want: want{state: v1alpha1.StateClosed, resolution: &v1alpha1.Resolution{By: v1alpha1.ResolvedByUser, At: at(0)}, reproduced: metav1.ConditionUnknown}},
+		{name: "Closed is final: analysis-failed stays", inc: newIncident(v1alpha1.StateClosed,
+			closedWith("", entry(personManager, "", fieldsClosed)),
+			func(i *v1alpha1.Incident) {
+				i.Status.Resolution = &v1alpha1.Resolution{By: v1alpha1.ResolvedByAnalysisFailed, At: at(0)}
+			}),
+			want: want{state: v1alpha1.StateClosed, resolution: &v1alpha1.Resolution{By: v1alpha1.ResolvedByAnalysisFailed, At: at(0)}, reproduced: metav1.ConditionUnknown}},
 		{name: "applied moves Open to Verifying and records an apply result", inc: newIncident(v1alpha1.StateOpen, withSpec(true, false), withLastChecks(v1alpha1.LastChecks{Precondition: pre1})),
 			want: want{state: v1alpha1.StateVerifying, lastChecks: &v1alpha1.LastChecks{Precondition: pre1, Apply: applyNow},
 				verifyingSince: nowT, reproduced: metav1.ConditionUnknown}, wantConsumed: true},

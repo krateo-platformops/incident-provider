@@ -13,13 +13,13 @@ An **Incident** is one occurrence of an Alert's problem, from its root-cause
 analysis to its end. An Alert (`alerts.observability.krateo.io`, owned by
 alert-provider) opens Incidents; it never closes them. Each Incident carries
 its own checks as bash scripts, and ends when a script proves the problem gone,
-a human closes it, or its Alert is deleted.
+a human closes it, its Alert is deleted, or its analysis fails.
 
 ## Who writes what
 
 | Actor | Writes |
 |---|---|
-| alert-provider (the writer) | creates the Incident with its label and `spec`; writes the analysis and `howToFix`; sets `Analyzing`, then `Open`; consumes `spec.reanalysis` |
+| alert-provider (the writer) | creates the Incident with its label and `spec`; writes the analysis and `howToFix`; sets `Analyzing`, then `Open`; consumes `spec.reanalysis`; closes a failed analysis: `spec.closed` with the annotation `observability.krateo.io/closed-reason: analysis-failed` |
 | incident-provider | runs precondition and verify; writes `lastChecks`, `verifyingSince`, every other state transition, `resolution` and the conditions |
 | a human, through the portal | `spec.applied` ("I applied it", or Apply), `spec.closed` (Close) and `spec.reanalysis` (Re-run analysis), with their own token and the `krateo-incident-responder` role; an IncidentApply (Run apply), which has the controller run the apply script with their own rights |
 
@@ -54,7 +54,7 @@ Open, Verifying ──Alert deleted──▶ Closed
 | `Verifying` | `Resolved` | verify exit `0`, at any time |
 | `Verifying` | `Open` | verify exit `1` once the settle window has passed |
 | `Open`, `Verifying` | `Analyzing` | `spec.reanalysis`, which the writer consumes: it clears the analysis and the checks' results and runs the analysis again |
-| any | `Closed` | `spec.closed: true` |
+| any | `Closed` | `spec.closed: true`: `resolution.by: user`, or `analysis-failed` when the writer closed a failed analysis (see [Closed by the writer](#closed-by-the-writer)) |
 | `Open`, `Verifying` | `Closed` | the Alert in `spec.alertRef` NotFound for the alert-gone grace (10 minutes by default): `resolution.by: alert-gone` |
 
 The settle window (5 minutes by default) gives a fix time to take effect. It
@@ -67,7 +67,7 @@ human applying again while `Verifying`, or an IncidentApply run that exits `0`,
 restarts the window; a failed IncidentApply run is recorded but does not.
 
 `Resolved` means a script proved the problem gone; `Closed` means a person
-decided, or the Alert was deleted. `Closed` is final, and a `Resolved`
+decided, the Alert was deleted, or the analysis failed. `Closed` is final, and a `Resolved`
 incident can only become `Closed`.
 
 The first precondition run with a verdict sets `Reproduced`: `True` on exit
@@ -105,8 +105,32 @@ been `True` for the alert-gone grace, the incident is `Closed` with
 problem gone. A missing Alert CRD, a denied read or an unreachable apiserver
 change nothing.
 
-A failed analysis leaves the incident `Open` with `error` set; a human can
-close it. An incident with no `howToFix` scripts gets no checks run.
+### Closed by the writer
+
+The writer closes an incident whose analysis failed (no scripts that can run)
+with one object patch: `spec.closed: true` and the annotation
+`observability.krateo.io/closed-reason: analysis-failed`. The controller
+records `resolution.by: analysis-failed` for it, `user` for any other
+`spec.closed`.
+
+The annotation alone does not say who closed: a person can close an incident
+that carries it, one the writer annotated in a race with their Close, or one
+copied from another incident. So it counts only when the field managers that
+own `spec.closed` in `metadata.managedFields` all own the annotation too:
+whoever set `closed` also set the reason. The apiserver gives a field to the
+manager of the write that changed it, so a person's Close is owned by their
+client (`kubectl-edit`, the portal's), and the writer's later patch of the
+same value takes nothing from it. Without `managedFields` that name an owner
+of `spec.closed`, the answer is `user`, as before `analysis-failed` existed.
+
+Field managers are names clients choose, not identities: a person who writes
+both fields in one write, or under the writer's manager name, is recorded as
+`analysis-failed`. `resolution.by` is a record, not a grant: anyone who may
+write `spec.closed` may close the incident anyway.
+
+A failed analysis the writer did not close (an older writer, or a refused
+close) stays `Open` with `error` set; a human can close it. An incident with
+no `howToFix` scripts gets no checks run.
 
 ## The scripts
 

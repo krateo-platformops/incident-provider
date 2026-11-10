@@ -93,8 +93,9 @@ spec:
                   records an apply result and sets applied back to false.
                 type: boolean
               closed:
-                description: Closed says a human closed the incident. It moves any
-                  state to Closed and cannot be unset.
+                description: |-
+                  Closed says a human closed the incident, or the writer did because its analysis failed (with
+                  the closed-reason annotation). It moves any state to Closed and cannot be unset.
                 type: boolean
               prompt:
                 description: Prompt is the root-cause-analysis prompt sent to incident-agent.
@@ -492,12 +493,14 @@ spec:
                     format: date-time
                     type: string
                   by:
-                    description: 'By is what ended it: verify (state Resolved), or
-                      user or alert-gone (state Closed).'
+                    description: |-
+                      By is what ended it: verify (state Resolved), or user, alert-gone or analysis-failed (state
+                      Closed).
                     enum:
                     - verify
                     - user
                     - alert-gone
+                    - analysis-failed
                     type: string
                 required:
                 - at
@@ -563,7 +566,7 @@ spec:
               rule: has(self.resolution) == (has(self.state) && self.state in ['Resolved',
                 'Closed'])
             - message: Resolved goes with resolution.by verify, Closed with resolution.by
-                user or alert-gone
+                user, alert-gone or analysis-failed
               rule: '!has(self.resolution) || (has(self.state) && ((self.resolution.by
                 == ''verify'') == (self.state == ''Resolved'')))'
             - message: Resolved can only become Closed, and Closed is final
