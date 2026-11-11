@@ -79,7 +79,9 @@ The root-cause analysis, written by the writer:
 | `report` | string (markdown) | the analysis |
 | `rootCause.statement` | string | the root cause |
 | `rootCause.confidence` | string | a decimal in [0, 1], e.g. `"0.85"` |
-| `rootCause.category` | string | `config`, `capacity`, `image`, `network`, `dependency`, `other` |
+| `rootCause.category` | `config` \| `capacity` \| `image` \| `network` \| `dependency` \| `permission` \| `other` | the failure class; `permission` is a request the cluster denied: RBAC (forbidden) or an admission policy. Any other value is rejected |
+| `rootCause.owner` | `customer` \| `krateo` \| `unknown` | who must act on the root cause. Absent: not assessed. `unknown`: assessed, the evidence does not decide; it never leads to a ticket proposal. The controller does not read it |
+| `rootCause.ownerEvidence[]` | `{kind, ref, note}`, at most 8 | what `owner` rests on. `kind` (required) is `component` \| `config` \| `trace` \| `log`; `ref` (required, 1-512 chars) is an object reference `group/Kind/namespace/name`, or a trace id; `note` (at most 300 chars) says why it points to the owner. A chart or controller Krateo ships points to `krateo`; the values of a customer's composition, or the customer's own external endpoint, point to `customer` |
 | `sources[]` | `{type, ref, excerpt}` | the evidence; `type` is `logs` \| `events` \| `metrics` \| `object` |
 | `reasoningTrace[]` | `{step, statement, evidenceRefs[]}` | the reasoning; `evidenceRefs` index `sources` from 0 |
 | `analyzedResources[]` | `{gvr, name, namespace, whatWasRead}` | the cluster objects the analysis read |
