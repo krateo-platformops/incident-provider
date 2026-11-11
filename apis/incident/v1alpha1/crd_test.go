@@ -16,12 +16,14 @@ import (
 	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	"k8s.io/apiextensions-apiserver/pkg/apiserver/schema"
 	"k8s.io/apiextensions-apiserver/pkg/apiserver/schema/cel"
+	"k8s.io/apiextensions-apiserver/pkg/apiserver/schema/cel/model"
 	"k8s.io/apiextensions-apiserver/pkg/apiserver/validation"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	utiljson "k8s.io/apimachinery/pkg/util/json"
 	"k8s.io/apimachinery/pkg/util/validation/field"
 	utilyaml "k8s.io/apimachinery/pkg/util/yaml"
 	celconfig "k8s.io/apiserver/pkg/apis/cel"
+	"k8s.io/apiserver/pkg/cel/common"
 	"sigs.k8s.io/yaml"
 
 	"github.com/krateo-platformops/incident-provider/apis/incident/v1alpha1"
@@ -107,6 +109,25 @@ func (v *validator) validate(obj, old map[string]any) field.ErrorList {
 	return append(errs, celErrs...)
 }
 
+// validateStatusUpdate checks obj as a write to the status subresource of the stored old, as the
+// apiserver's status strategy does with validation ratcheting (CRDValidationRatcheting: on by
+// default since Kubernetes 1.30, locked on since 1.33): a value that fails the schema but is
+// unchanged from old is let through. validate, with an old, is the same write without ratcheting.
+func (v *validator) validateStatusUpdate(t *testing.T, obj, old map[string]any) field.ErrorList {
+	t.Helper()
+	st := openAPISchema(t).Properties["status"]
+	sv, _, err := validation.NewSchemaValidator(&st)
+	if err != nil {
+		t.Fatal(err)
+	}
+	correlated := common.NewCorrelatedObject(obj, old, &model.Structural{Structural: v.structural})
+	errs := validation.ValidateCustomResourceUpdate(field.NewPath("status"), obj["status"], old["status"], sv,
+		validation.WithRatcheting(correlated.Key("status")))
+	celErrs, _ := v.cel.Validate(context.Background(), nil, v.structural, obj, old, celconfig.RuntimeCELCostBudget,
+		cel.WithRatcheting(correlated))
+	return append(errs, celErrs...)
+}
+
 // example returns a fresh copy of examples/incident/incident.yaml: a Resolved incident.
 func example(t *testing.T) map[string]any {
 	t.Helper()
@@ -120,6 +141,28 @@ func status(obj map[string]any) map[string]any { return obj["status"].(map[strin
 
 func lastChecks(obj map[string]any) map[string]any {
 	return status(obj)["lastChecks"].(map[string]any)
+}
+
+func rootCause(obj map[string]any) map[string]any {
+	return status(obj)["rootCause"].(map[string]any)
+}
+
+// withRootCause returns the example with edit applied to status.rootCause.
+func withRootCause(edit func(rc map[string]any)) func(t *testing.T) map[string]any {
+	return func(t *testing.T) map[string]any {
+		obj := example(t)
+		edit(rootCause(obj))
+		return obj
+	}
+}
+
+// evidence returns n valid pieces of owner evidence.
+func evidence(n int) []any {
+	out := make([]any, n)
+	for i := range out {
+		out[i] = map[string]any{"kind": "component", "ref": "apps/Deployment/krateo-system/snowplow"}
+	}
+	return out
 }
 
 // withState returns the example in state, with the resolution that state needs.
@@ -407,6 +450,114 @@ func TestValidation(t *testing.T) {
 		})
 	}
 
+	// rootCause.category, .owner and .ownerEvidence: all optional, each closed to its list.
+	cases = append(cases,
+		validationCase{
+			name: "a root cause without category, owner or ownerEvidence",
+			obj: withRootCause(func(rc map[string]any) {
+				delete(rc, "category")
+				delete(rc, "owner")
+				delete(rc, "ownerEvidence")
+			}),
+		},
+		validationCase{
+			name: "no root cause",
+			obj: func(t *testing.T) map[string]any {
+				obj := example(t)
+				delete(status(obj), "rootCause")
+				return obj
+			},
+		},
+		validationCase{
+			name:    "a category outside the enum",
+			obj:     withRootCause(func(rc map[string]any) { rc["category"] = "rbac" }),
+			wantErr: `status.rootCause.category: Unsupported value: "rbac"`,
+		},
+		validationCase{
+			name:    "an empty category",
+			obj:     withRootCause(func(rc map[string]any) { rc["category"] = "" }),
+			wantErr: `status.rootCause.category: Unsupported value: ""`,
+		},
+		validationCase{
+			name:    "an owner outside the enum",
+			obj:     withRootCause(func(rc map[string]any) { rc["owner"] = "vendor" }),
+			wantErr: `status.rootCause.owner: Unsupported value: "vendor"`,
+		},
+		validationCase{
+			name:    "an evidence kind outside the enum",
+			obj:     withRootCause(func(rc map[string]any) { rc["ownerEvidence"] = []any{map[string]any{"kind": "metric", "ref": "x"}} }),
+			wantErr: `status.rootCause.ownerEvidence[0].kind: Unsupported value: "metric"`,
+		},
+		validationCase{
+			name: "owner without evidence",
+			obj:  withRootCause(func(rc map[string]any) { rc["owner"] = "unknown"; delete(rc, "ownerEvidence") }),
+		},
+		validationCase{
+			name: "8 pieces of evidence",
+			obj:  withRootCause(func(rc map[string]any) { rc["ownerEvidence"] = evidence(8) }),
+		},
+		validationCase{
+			name:    "9 pieces of evidence",
+			obj:     withRootCause(func(rc map[string]any) { rc["ownerEvidence"] = evidence(9) }),
+			wantErr: "status.rootCause.ownerEvidence: Too many: 9: must have at most 8 items",
+		},
+		validationCase{
+			name:    "evidence without a kind",
+			obj:     withRootCause(func(rc map[string]any) { rc["ownerEvidence"] = []any{map[string]any{"ref": "x"}} }),
+			wantErr: "status.rootCause.ownerEvidence[0].kind: Required value",
+		},
+		validationCase{
+			name:    "evidence without a ref",
+			obj:     withRootCause(func(rc map[string]any) { rc["ownerEvidence"] = []any{map[string]any{"kind": "trace"}} }),
+			wantErr: "status.rootCause.ownerEvidence[0].ref: Required value",
+		},
+		validationCase{
+			name:    "evidence with an empty ref",
+			obj:     withRootCause(func(rc map[string]any) { rc["ownerEvidence"] = []any{map[string]any{"kind": "trace", "ref": ""}} }),
+			wantErr: "status.rootCause.ownerEvidence[0].ref: Invalid value",
+		},
+		validationCase{
+			name: "a ref of 512 and a note of 300 characters",
+			obj: withRootCause(func(rc map[string]any) {
+				rc["ownerEvidence"] = []any{map[string]any{"kind": "log", "ref": strings.Repeat("r", 512), "note": strings.Repeat("n", 300)}}
+			}),
+		},
+		validationCase{
+			name: "a ref over 512 characters",
+			obj: withRootCause(func(rc map[string]any) {
+				rc["ownerEvidence"] = []any{map[string]any{"kind": "log", "ref": strings.Repeat("r", 513)}}
+			}),
+			wantErr: "status.rootCause.ownerEvidence[0].ref: Too long",
+		},
+		validationCase{
+			name: "a note over 300 characters",
+			obj: withRootCause(func(rc map[string]any) {
+				rc["ownerEvidence"] = []any{map[string]any{"kind": "log", "ref": "x", "note": strings.Repeat("n", 301)}}
+			}),
+			wantErr: "status.rootCause.ownerEvidence[0].note: Too long",
+		},
+	)
+	for _, c := range []string{"config", "capacity", "image", "network", "dependency", "permission", "other"} {
+		cases = append(cases, validationCase{
+			name: "category " + c + " is valid",
+			obj:  withRootCause(func(rc map[string]any) { rc["category"] = c }),
+		})
+	}
+	for _, o := range []string{"customer", "krateo", "unknown"} {
+		cases = append(cases, validationCase{
+			name: "owner " + o + " is valid",
+			obj:  withRootCause(func(rc map[string]any) { rc["owner"] = o }),
+		})
+	}
+	for _, k := range []string{"component", "config", "trace", "log"} {
+		cases = append(cases, validationCase{
+			name: "evidence kind " + k + " is valid",
+			obj: withRootCause(func(rc map[string]any) {
+				rc["ownerEvidence"] = []any{map[string]any{"kind": k, "ref": "4bf92f3577b34da6a3ce929d0e0e4736"}}
+			}),
+		})
+	}
+
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			var old map[string]any
@@ -420,9 +571,87 @@ func TestValidation(t *testing.T) {
 				}
 				return
 			}
+			if len(errs) == 0 {
+				t.Fatalf("want an error containing %q, got none", tc.wantErr)
+			}
 			if !strings.Contains(errs.ToAggregate().Error(), tc.wantErr) {
 				t.Fatalf("want an error containing %q, got %v", tc.wantErr, errs)
 			}
+		})
+	}
+}
+
+// TestStoredCategoryOutsideTheEnum is the migration risk of closing rootCause.category to a list:
+// an incident stored before the list, with a category outside it, gets a status write (here the
+// controller moving it from Open to Verifying) that leaves the category as it is. Without ratcheting
+// the write fails, so the incident is stuck until something rewrites the category. With ratcheting
+// it goes through. Either way a write that sets a category outside the list fails: a writer that
+// still emits one loses the whole status write.
+func TestStoredCategoryOutsideTheEnum(t *testing.T) {
+	v := newValidator(t)
+	stored := func(t *testing.T) map[string]any {
+		obj := withState(t, "Open")
+		rootCause(obj)["category"] = "security"
+		return obj
+	}
+	withCategory := func(c string) func(t *testing.T) map[string]any {
+		return func(t *testing.T) map[string]any {
+			obj := withState(t, "Verifying")
+			rootCause(obj)["category"] = c
+			return obj
+		}
+	}
+	cases := []struct {
+		name string
+		obj  func(t *testing.T) map[string]any
+		// wantErr, wantErrRatcheting: the error without and with ratcheting; empty for none.
+		wantErr, wantErrRatcheting string
+	}{
+		{
+			name:    "the category is left as it is",
+			obj:     withCategory("security"),
+			wantErr: `status.rootCause.category: Unsupported value: "security"`,
+		},
+		{
+			name:              "the category changes to another value outside the list",
+			obj:               withCategory("auth"),
+			wantErr:           `status.rootCause.category: Unsupported value: "auth"`,
+			wantErrRatcheting: `status.rootCause.category: Unsupported value: "auth"`,
+		},
+		{
+			name: "the category changes to a value in the list",
+			obj:  withCategory("permission"),
+		},
+		{
+			name: "the category is removed",
+			obj: func(t *testing.T) map[string]any {
+				obj := withCategory("security")(t)
+				delete(rootCause(obj), "category")
+				return obj
+			},
+		},
+	}
+	check := func(t *testing.T, errs field.ErrorList, want string) {
+		t.Helper()
+		if want == "" {
+			if len(errs) > 0 {
+				t.Fatalf("want no error, got %v", errs)
+			}
+			return
+		}
+		if len(errs) == 0 {
+			t.Fatalf("want an error containing %q, got none", want)
+		}
+		if !strings.Contains(errs.ToAggregate().Error(), want) {
+			t.Fatalf("want an error containing %q, got %v", want, errs)
+		}
+	}
+	for _, tc := range cases {
+		t.Run(tc.name+", without ratcheting", func(t *testing.T) {
+			check(t, v.validate(tc.obj(t), stored(t)), tc.wantErr)
+		})
+		t.Run(tc.name+", with ratcheting", func(t *testing.T) {
+			check(t, v.validateStatusUpdate(t, tc.obj(t), stored(t)), tc.wantErrRatcheting)
 		})
 	}
 }
@@ -479,6 +708,26 @@ func TestConstantsMatchCRD(t *testing.T) {
 	}
 	if d := cmp.Diff(resolvedBy, enum(st.Properties["resolution"].Properties["by"])); d != "" {
 		t.Errorf("status.resolution.by enum differs from the ResolvedBy constants (-want +got):\n%s", d)
+	}
+	rc := st.Properties["rootCause"]
+	categories := []string{
+		string(v1alpha1.CategoryConfig), string(v1alpha1.CategoryCapacity), string(v1alpha1.CategoryImage),
+		string(v1alpha1.CategoryNetwork), string(v1alpha1.CategoryDependency), string(v1alpha1.CategoryPermission),
+		string(v1alpha1.CategoryOther),
+	}
+	if d := cmp.Diff(categories, enum(rc.Properties["category"])); d != "" {
+		t.Errorf("status.rootCause.category enum differs from the Category constants (-want +got):\n%s", d)
+	}
+	owners := []string{string(v1alpha1.OwnerCustomer), string(v1alpha1.OwnerKrateo), string(v1alpha1.OwnerUnknown)}
+	if d := cmp.Diff(owners, enum(rc.Properties["owner"])); d != "" {
+		t.Errorf("status.rootCause.owner enum differs from the Owner constants (-want +got):\n%s", d)
+	}
+	kinds := []string{
+		string(v1alpha1.OwnerEvidenceComponent), string(v1alpha1.OwnerEvidenceConfig),
+		string(v1alpha1.OwnerEvidenceTrace), string(v1alpha1.OwnerEvidenceLog),
+	}
+	if d := cmp.Diff(kinds, enum(rc.Properties["ownerEvidence"].Items.Schema.Properties["kind"])); d != "" {
+		t.Errorf("status.rootCause.ownerEvidence[].kind enum differs from the OwnerEvidenceKind constants (-want +got):\n%s", d)
 	}
 	var scripts []string
 	for k := range st.Properties["lastChecks"].Properties {

@@ -510,12 +510,69 @@ spec:
                 description: RootCause is the analysis' conclusion.
                 properties:
                   category:
-                    description: 'Category is the failure class: config, capacity,
-                      image, network, dependency, other.'
+                    description: |-
+                      Category is the failure class: config, capacity, image, network, dependency, permission (an
+                      RBAC or admission denial) or other.
+                    enum:
+                    - config
+                    - capacity
+                    - image
+                    - network
+                    - dependency
+                    - permission
+                    - other
                     type: string
                   confidence:
                     description: Confidence is a decimal string in [0, 1], e.g. "0.85".
                     type: string
+                  owner:
+                    description: |-
+                      Owner is who must act on the root cause: customer or krateo, or unknown when the evidence
+                      does not decide. Absent: the owner was not assessed. Writers derive it from ownerEvidence: a
+                      chart or controller Krateo ships points to krateo; the values of a customer's composition, or
+                      the customer's own external endpoint, point to customer. unknown never leads to a ticket
+                      proposal. The controller does not read it: it changes neither the state nor resolution.by.
+                    enum:
+                    - customer
+                    - krateo
+                    - unknown
+                    type: string
+                  ownerEvidence:
+                    description: OwnerEvidence is what the owner rests on, at most
+                      8 pieces.
+                    items:
+                      description: OwnerEvidence is one piece of evidence for RootCause.Owner.
+                      properties:
+                        kind:
+                          description: |-
+                            Kind is what Ref points at: component (a chart or controller; one Krateo ships points to
+                            krateo), config (an object holding configuration; a customer composition's values point to
+                            customer), trace (a trace id) or log (the object that wrote the log line).
+                          enum:
+                          - component
+                          - config
+                          - trace
+                          - log
+                          type: string
+                        note:
+                          description: |-
+                            Note says, in a sentence, why this evidence points to the owner, e.g. "chart shipped by
+                            Krateo" or "endpoint is the customer's own API".
+                          maxLength: 300
+                          type: string
+                        ref:
+                          description: |-
+                            Ref is an object reference, group/Kind/namespace/name (namespace empty for a cluster-scoped
+                            object, group empty for the core group), or for kind trace a trace id.
+                          maxLength: 512
+                          minLength: 1
+                          type: string
+                      required:
+                      - kind
+                      - ref
+                      type: object
+                    maxItems: 8
+                    type: array
                   statement:
                     description: Statement is the root cause.
                     type: string

@@ -79,6 +79,11 @@ status:
     statement: CompositionDefinition fireworksapp pins chart version 1.1.9, which the chart repository does not serve.
     confidence: "0.85"
     category: config
+    owner: customer
+    ownerEvidence:
+      - kind: config
+        ref: core.krateo.io/CompositionDefinition/fireworksapp-system/fireworksapp
+        note: The chart version is a value of the customer's CompositionDefinition.
   sources:
     - type: object
       ref: compositiondefinitions.core.krateo.io/fireworksapp -n fireworksapp-system

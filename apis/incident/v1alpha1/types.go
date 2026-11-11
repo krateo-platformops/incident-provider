@@ -91,6 +91,56 @@ const (
 	SourceObject  SourceType = "object"
 )
 
+// Category is the failure class of a root cause.
+// +kubebuilder:validation:Enum=config;capacity;image;network;dependency;permission;other
+type Category string
+
+const (
+	// CategoryConfig: a wrong value in configuration, e.g. a chart version that does not exist.
+	CategoryConfig Category = "config"
+	// CategoryCapacity: not enough of a resource: CPU, memory, quota, disk, pods.
+	CategoryCapacity Category = "capacity"
+	// CategoryImage: an image that cannot be pulled or does not start.
+	CategoryImage Category = "image"
+	// CategoryNetwork: a connection that fails: DNS, a NetworkPolicy, TLS, an unreachable endpoint.
+	CategoryNetwork Category = "network"
+	// CategoryDependency: a service the workload depends on is down or wrong.
+	CategoryDependency Category = "dependency"
+	// CategoryPermission: a request the cluster denied: RBAC (forbidden) or an admission policy.
+	CategoryPermission Category = "permission"
+	// CategoryOther: none of the above.
+	CategoryOther Category = "other"
+)
+
+// Owner is who must act on a root cause.
+// +kubebuilder:validation:Enum=customer;krateo;unknown
+type Owner string
+
+const (
+	// OwnerCustomer: the cause is in what the customer controls: the values of their compositions,
+	// their own external endpoints.
+	OwnerCustomer Owner = "customer"
+	// OwnerKrateo: the cause is in what Krateo ships: a chart, a controller, a platform default.
+	OwnerKrateo Owner = "krateo"
+	// OwnerUnknown: assessed, but the evidence does not decide. It never leads to a ticket proposal.
+	OwnerUnknown Owner = "unknown"
+)
+
+// OwnerEvidenceKind is what a piece of owner evidence points at.
+// +kubebuilder:validation:Enum=component;config;trace;log
+type OwnerEvidenceKind string
+
+const (
+	// OwnerEvidenceComponent: a shipped component, e.g. the chart or controller that failed.
+	OwnerEvidenceComponent OwnerEvidenceKind = "component"
+	// OwnerEvidenceConfig: an object holding configuration, e.g. a composition and its values.
+	OwnerEvidenceConfig OwnerEvidenceKind = "config"
+	// OwnerEvidenceTrace: a trace, by its trace id.
+	OwnerEvidenceTrace OwnerEvidenceKind = "trace"
+	// OwnerEvidenceLog: a log line, by the object that wrote it.
+	OwnerEvidenceLog OwnerEvidenceKind = "log"
+)
+
 // TypeReproduced is a condition on the first precondition run with a verdict. True: it exited 1,
 // so the script sees the incident. False: it exited 0, so the problem was gone by the first check;
 // the incident moves to Verifying and verify decides. It is a record only: neither status stops a
@@ -342,9 +392,43 @@ type RootCause struct {
 	// +optional
 	Confidence string `json:"confidence,omitempty"`
 
-	// Category is the failure class: config, capacity, image, network, dependency, other.
+	// Category is the failure class: config, capacity, image, network, dependency, permission (an
+	// RBAC or admission denial) or other.
 	// +optional
-	Category string `json:"category,omitempty"`
+	Category Category `json:"category,omitempty"`
+
+	// Owner is who must act on the root cause: customer or krateo, or unknown when the evidence
+	// does not decide. Absent: the owner was not assessed. Writers derive it from ownerEvidence: a
+	// chart or controller Krateo ships points to krateo; the values of a customer's composition, or
+	// the customer's own external endpoint, point to customer. unknown never leads to a ticket
+	// proposal. The controller does not read it: it changes neither the state nor resolution.by.
+	// +optional
+	Owner Owner `json:"owner,omitempty"`
+
+	// OwnerEvidence is what the owner rests on, at most 8 pieces.
+	// +kubebuilder:validation:MaxItems=8
+	// +optional
+	OwnerEvidence []OwnerEvidence `json:"ownerEvidence,omitempty"`
+}
+
+// OwnerEvidence is one piece of evidence for RootCause.Owner.
+type OwnerEvidence struct {
+	// Kind is what Ref points at: component (a chart or controller; one Krateo ships points to
+	// krateo), config (an object holding configuration; a customer composition's values point to
+	// customer), trace (a trace id) or log (the object that wrote the log line).
+	Kind OwnerEvidenceKind `json:"kind"`
+
+	// Ref is an object reference, group/Kind/namespace/name (namespace empty for a cluster-scoped
+	// object, group empty for the core group), or for kind trace a trace id.
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=512
+	Ref string `json:"ref"`
+
+	// Note says, in a sentence, why this evidence points to the owner, e.g. "chart shipped by
+	// Krateo" or "endpoint is the customer's own API".
+	// +kubebuilder:validation:MaxLength=300
+	// +optional
+	Note string `json:"note,omitempty"`
 }
 
 // Source is one piece of evidence the analysis rests on.
