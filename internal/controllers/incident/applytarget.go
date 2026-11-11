@@ -123,14 +123,18 @@ func hasResource(l *metav1.APIResourceList, resource string) bool {
 }
 
 // observeApplyAction sets ApplyActionStale from t, what discovery says about the target of the
-// incident's applyAction: True when it is not served, False when it is. Without an applyAction the
-// condition is removed. t nil means discovery was not read, or the read failed: the condition stays
-// as it is. lastTransitionTime changes only when the status flips. applyAction itself is never
-// changed.
+// incident's applyAction: True when it is not served, False when it is. An Open or Verifying
+// incident without an applyAction loses the condition. In the other states it is left as it is:
+// a reanalysis (Analyzing) clears howToFix, and the condition must outlive it, so that a new
+// analysis that targets an unserved version again continues the episode instead of starting a new
+// one. t nil means discovery was not read, or the read failed: the condition stays as it is.
+// lastTransitionTime changes only when the status flips. applyAction itself is never changed.
 func observeApplyAction(inc *v1alpha1.Incident, t *applyTarget, now time.Time) []change {
 	a := applyActionOf(inc)
 	if a == nil {
-		removeCondition(inc, v1alpha1.TypeApplyActionStale)
+		if s := inc.Status.State; s == v1alpha1.StateOpen || s == v1alpha1.StateVerifying {
+			removeCondition(inc, v1alpha1.TypeApplyActionStale)
+		}
 		return nil
 	}
 	if t == nil {
@@ -209,4 +213,55 @@ func (r *targetReads) forget(uid types.UID) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	delete(r.at, uid)
+}
+
+// staleReanalysisDue reports whether the incident's ApplyActionStale episode calls for the
+// controller's reanalysis request: the incident is Open or Verifying, ApplyActionStale is True, no
+// request is pending (a person's wins), and no reanalysis was consumed since the condition became
+// True (the episode is answered). A new analysis that targets an unserved version again keeps the
+// condition True, so its episode is still answered: there is one request per episode.
+func staleReanalysisDue(inc *v1alpha1.Incident) bool {
+	if s := inc.Status.State; s != v1alpha1.StateOpen && s != v1alpha1.StateVerifying {
+		return false
+	}
+	c := inc.GetCondition(v1alpha1.TypeApplyActionStale)
+	if c.Status != metav1.ConditionTrue || inc.Spec.Reanalysis != nil {
+		return false
+	}
+	if r := inc.Status.Reanalysis; r != nil && !r.At.Before(&c.LastTransitionTime) {
+		return false
+	}
+	return true
+}
+
+// episodes is, per incident, the ApplyActionStale episode (its lastTransitionTime) the controller
+// last requested a reanalysis for. Held in memory only. It bounds the requests of an episode to
+// one per process even when the writer drops a request without answering it (in a state or for an
+// incident it does not reanalyze), which leaves status.reanalysis unchanged.
+type episodes struct {
+	mu sync.Mutex
+	at map[types.UID]time.Time
+}
+
+func newEpisodes() *episodes {
+	return &episodes{at: map[types.UID]time.Time{}}
+}
+
+func (e *episodes) requested(uid types.UID, episode time.Time) bool {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	at, ok := e.at[uid]
+	return ok && at.Equal(episode)
+}
+
+func (e *episodes) request(uid types.UID, episode time.Time) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.at[uid] = episode
+}
+
+func (e *episodes) forget(uid types.UID) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	delete(e.at, uid)
 }

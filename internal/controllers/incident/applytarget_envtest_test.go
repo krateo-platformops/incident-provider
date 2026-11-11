@@ -22,6 +22,7 @@ import (
 	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/config"
 	"sigs.k8s.io/controller-runtime/pkg/envtest"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 
@@ -81,9 +82,13 @@ func widgetCRD() *apiextensionsv1.CustomResourceDefinition {
 	}
 }
 
-// TestApplyActionStaleEnvtest runs the Incident reconciler against a real API server, and changes
-// which versions of the target's CRD it serves.
-func TestApplyActionStaleEnvtest(t *testing.T) {
+const poll = time.Second
+
+// startEnvtest starts an API server with the Incident and widget CRDs, and a manager running the
+// Incident reconciler with disc as its discovery, polling every poll. The checks namespace and
+// demo exist.
+func startEnvtest(t *testing.T) (context.Context, client.Client, *switchableDiscovery) {
+	t.Helper()
 	env := &envtest.Environment{
 		CRDInstallOptions: envtest.CRDInstallOptions{
 			Paths: []string{filepath.Join("..", "..", "..", "helm", "incident-provider-crds", "templates", "observability.krateo.io_incidents.yaml")},
@@ -103,7 +108,9 @@ func TestApplyActionStaleEnvtest(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	mgr, err := ctrl.NewManager(cfg, ctrl.Options{Scheme: scheme, Metrics: metricsserver.Options{BindAddress: "0"}})
+	// Each test runs its own manager in this process: the controller names repeat.
+	mgr, err := ctrl.NewManager(cfg, ctrl.Options{Scheme: scheme, Metrics: metricsserver.Options{BindAddress: "0"},
+		Controller: config.Controller{SkipNameValidation: ptr.To(true)}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -113,7 +120,6 @@ func TestApplyActionStaleEnvtest(t *testing.T) {
 	}
 	disc := &switchableDiscovery{DiscoveryClient: dc}
 
-	const poll = time.Second
 	if err := Setup(mgr, Options{
 		Controller: option.ControllerOptions{
 			Options: controller.Options{
@@ -147,6 +153,13 @@ func TestApplyActionStaleEnvtest(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	return ctx, kube, disc
+}
+
+// TestApplyActionStaleEnvtest runs the Incident reconciler against a real API server, and changes
+// which versions of the target's CRD it serves.
+func TestApplyActionStaleEnvtest(t *testing.T) {
+	ctx, kube, disc := startEnvtest(t)
 
 	// The writer creates the incident, then writes its analysis to the status.
 	inc := &v1alpha1.Incident{

@@ -537,6 +537,29 @@ func TestValidation(t *testing.T) {
 			wantErr: "status.rootCause.ownerEvidence[0].note: Too long",
 		},
 	)
+	// spec.reanalysis.cause and status.reanalysis.cause: Person or ApplyActionStale.
+	withReanalysis := func(cause any) func(t *testing.T) map[string]any {
+		return func(t *testing.T) map[string]any {
+			obj := example(t)
+			req := map[string]any{"feedback": "x"}
+			rec := map[string]any{"at": "2026-09-25T14:09:00Z", "count": int64(1)}
+			if cause != nil {
+				req["cause"], rec["cause"] = cause, cause
+			}
+			spec(obj)["reanalysis"], status(obj)["reanalysis"] = req, rec
+			return obj
+		}
+	}
+	for _, c := range []string{"Person", "ApplyActionStale"} {
+		cases = append(cases, validationCase{name: "reanalysis cause " + c + " is valid", obj: withReanalysis(c)})
+	}
+	cases = append(cases,
+		validationCase{name: "a reanalysis without a cause", obj: withReanalysis(nil)},
+		validationCase{name: "a reanalysis cause outside the enum", obj: withReanalysis("Agent"),
+			wantErr: `spec.reanalysis.cause: Unsupported value: "Agent"`},
+		validationCase{name: "a recorded reanalysis cause outside the enum", obj: withReanalysis("Agent"),
+			wantErr: `status.reanalysis.cause: Unsupported value: "Agent"`},
+	)
 	for _, c := range []string{"config", "capacity", "image", "network", "dependency", "permission", "other"} {
 		cases = append(cases, validationCase{
 			name: "category " + c + " is valid",
@@ -728,6 +751,18 @@ func TestConstantsMatchCRD(t *testing.T) {
 	}
 	if d := cmp.Diff(kinds, enum(rc.Properties["ownerEvidence"].Items.Schema.Properties["kind"])); d != "" {
 		t.Errorf("status.rootCause.ownerEvidence[].kind enum differs from the OwnerEvidenceKind constants (-want +got):\n%s", d)
+	}
+	causes := []string{string(v1alpha1.ReanalysisCausePerson), string(v1alpha1.ReanalysisCauseApplyActionStale)}
+	for path, p := range map[string]apiextensions.JSONSchemaProps{
+		"spec.reanalysis.cause":   s.Properties["spec"].Properties["reanalysis"].Properties["cause"],
+		"status.reanalysis.cause": st.Properties["reanalysis"].Properties["cause"],
+	} {
+		if d := cmp.Diff(causes, enum(p)); d != "" {
+			t.Errorf("%s enum differs from the ReanalysisCause constants (-want +got):\n%s", path, d)
+		}
+		if p.Default == nil || *p.Default != apiextensions.JSON(string(v1alpha1.ReanalysisCausePerson)) {
+			t.Errorf("%s default = %v, want %s", path, p.Default, v1alpha1.ReanalysisCausePerson)
+		}
 	}
 	var scripts []string
 	for k := range st.Properties["lastChecks"].Properties {

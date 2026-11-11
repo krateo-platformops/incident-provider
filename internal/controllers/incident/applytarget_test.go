@@ -1,16 +1,22 @@
 package incident
 
 import (
+	"context"
 	"errors"
 	"testing"
 	"time"
 
 	"github.com/google/go-cmp/cmp"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/discovery/fake"
 	clienttesting "k8s.io/client-go/testing"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	prv1 "github.com/krateo-platformops/provider-runtime/apis/common/v1"
+	"github.com/krateo-platformops/provider-runtime/pkg/test"
 
 	"github.com/krateo-platformops/incident-provider/apis/incident/v1alpha1"
 )
@@ -73,12 +79,23 @@ func TestObserveApplyAction(t *testing.T) {
 		{name: "no applyAction: the condition is removed",
 			inc:    newIncident(v1alpha1.StateOpen, withStale(metav1.ConditionTrue, v1alpha1.ReasonVersionNotServed, staleMsg, 0)),
 			target: &applyTarget{served: true}},
-		{name: "no howToFix: the condition is removed",
-			inc: newIncident(v1alpha1.StateAnalyzing, withStale(metav1.ConditionTrue, v1alpha1.ReasonVersionNotServed, staleMsg, 0), withoutHowToFix)},
+		{name: "Open without howToFix: the condition is removed",
+			inc: newIncident(v1alpha1.StateOpen, withStale(metav1.ConditionTrue, v1alpha1.ReasonVersionNotServed, staleMsg, 0), withoutHowToFix)},
+		{name: "Analyzing, the reanalysis cleared howToFix: the condition stays, for the episode",
+			inc:  newIncident(v1alpha1.StateAnalyzing, withStale(metav1.ConditionTrue, v1alpha1.ReasonVersionNotServed, staleMsg, 0), withoutHowToFix),
+			want: &prv1.Condition{Status: metav1.ConditionTrue, Reason: v1alpha1.ReasonVersionNotServed, Message: staleMsg, LastTransitionTime: at(0)}},
+		{name: "Closed without howToFix: the condition stays",
+			inc: newIncident(v1alpha1.StateClosed, withStale(metav1.ConditionTrue, v1alpha1.ReasonVersionNotServed, staleMsg, 0), withoutHowToFix, func(i *v1alpha1.Incident) {
+				i.Status.Resolution = &v1alpha1.Resolution{By: v1alpha1.ResolvedByUser, At: at(0)}
+			}),
+			want: &prv1.Condition{Status: metav1.ConditionTrue, Reason: v1alpha1.ReasonVersionNotServed, Message: staleMsg, LastTransitionTime: at(0)}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			before := tc.inc.Status.HowToFix.DeepCopy()
+			var before *v1alpha1.HowToFix
+			if tc.inc.Status.HowToFix != nil {
+				before = tc.inc.Status.HowToFix.DeepCopy()
+			}
 			changes := observeApplyAction(tc.inc, tc.target, now)
 			var got *prv1.Condition
 			for i, c := range tc.inc.Status.Conditions {
@@ -167,6 +184,120 @@ func TestLookupApplyTarget(t *testing.T) {
 			}
 			if d := cmp.Diff(tc.want, got, cmp.AllowUnexported(applyTarget{})); d != "" {
 				t.Errorf("target (-want +got):\n%s", d)
+			}
+		})
+	}
+}
+
+func TestStaleReanalysisDue(t *testing.T) {
+	stale := withStale(metav1.ConditionTrue, v1alpha1.ReasonVersionNotServed, "m", 10*time.Minute)
+	consumed := func(d time.Duration) incOpt {
+		return func(i *v1alpha1.Incident) {
+			i.Status.Reanalysis = &v1alpha1.Reanalysis{At: at(d), Count: 1, Cause: v1alpha1.ReanalysisCausePerson}
+		}
+	}
+	pending := func(i *v1alpha1.Incident) {
+		i.Spec.Reanalysis = &v1alpha1.ReanalysisRequest{Cause: v1alpha1.ReanalysisCausePerson}
+	}
+	cases := []struct {
+		name string
+		inc  *v1alpha1.Incident
+		want bool
+	}{
+		{name: "Open, stale: due", inc: newIncident(v1alpha1.StateOpen, stale), want: true},
+		{name: "Verifying, stale: due", inc: newIncident(v1alpha1.StateVerifying, withVerifyingSince(0), stale), want: true},
+		{name: "a reanalysis consumed before the episode: due", inc: newIncident(v1alpha1.StateOpen, stale, consumed(5*time.Minute)), want: true},
+		{name: "a reanalysis consumed in the episode: answered", inc: newIncident(v1alpha1.StateOpen, stale, consumed(15*time.Minute))},
+		{name: "a reanalysis consumed as the episode began: answered", inc: newIncident(v1alpha1.StateOpen, stale, consumed(10*time.Minute))},
+		{name: "a request pending: it wins", inc: newIncident(v1alpha1.StateOpen, stale, pending)},
+		{name: "served", inc: newIncident(v1alpha1.StateOpen, withStale(metav1.ConditionFalse, v1alpha1.ReasonServed, "m", 10*time.Minute))},
+		{name: "no condition", inc: newIncident(v1alpha1.StateOpen)},
+		{name: "Analyzing", inc: newIncident(v1alpha1.StateAnalyzing, stale)},
+		{name: "Resolved", inc: newIncident(v1alpha1.StateResolved, stale)},
+		{name: "Closed", inc: newIncident(v1alpha1.StateClosed, stale)},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := staleReanalysisDue(tc.inc); got != tc.want {
+				t.Errorf("staleReanalysisDue = %t, want %t", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestRequestReanalysis covers the write: a merge patch of spec.reanalysis alone, with the
+// resourceVersion read, and on a conflict a fresh read and the guards checked again.
+func TestRequestReanalysis(t *testing.T) {
+	stale := withStale(metav1.ConditionTrue, v1alpha1.ReasonVersionNotServed, "applyAction targets x/v1 widgets, which this cluster does not serve; served: v2", 0)
+	conflict := apierrors.NewConflict(schema.GroupResource{Group: "observability.krateo.io", Resource: "incidents"}, "x", errors.New("the object has been modified"))
+	cases := []struct {
+		name string
+		// fresh is what a read after a conflict returns.
+		fresh       func() *v1alpha1.Incident
+		conflicts   int
+		wantPatches []string
+		wantErr     bool
+	}{
+		{name: "no conflict: one patch", wantPatches: []string{
+			`{"metadata":{"resourceVersion":"7"},"spec":{"reanalysis":{"cause":"ApplyActionStale","feedback":"applyAction targets a version this cluster no longer serves"}}}`}},
+		{name: "a conflict, still due: the patch again, with the new resourceVersion", conflicts: 1,
+			fresh: func() *v1alpha1.Incident {
+				i := newIncident(v1alpha1.StateOpen, withApplyAction("x/v1", "widgets"), stale)
+				i.ResourceVersion = "8"
+				return i
+			},
+			wantPatches: []string{
+				`{"metadata":{"resourceVersion":"7"},"spec":{"reanalysis":{"cause":"ApplyActionStale","feedback":"applyAction targets a version this cluster no longer serves"}}}`,
+				`{"metadata":{"resourceVersion":"8"},"spec":{"reanalysis":{"cause":"ApplyActionStale","feedback":"applyAction targets a version this cluster no longer serves"}}}`}},
+		{name: "a conflict with a person's request: it wins, no second patch", conflicts: 1,
+			fresh: func() *v1alpha1.Incident {
+				i := newIncident(v1alpha1.StateOpen, withApplyAction("x/v1", "widgets"), stale)
+				i.ResourceVersion = "8"
+				i.Spec.Reanalysis = &v1alpha1.ReanalysisRequest{Cause: v1alpha1.ReanalysisCausePerson}
+				return i
+			},
+			wantPatches: []string{
+				`{"metadata":{"resourceVersion":"7"},"spec":{"reanalysis":{"cause":"ApplyActionStale","feedback":"applyAction targets a version this cluster no longer serves"}}}`}},
+		{name: "conflicts every time: an error", conflicts: maxRequestAttempts, wantErr: true,
+			fresh: func() *v1alpha1.Incident {
+				return newIncident(v1alpha1.StateOpen, withApplyAction("x/v1", "widgets"), stale)
+			}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			inc := newIncident(v1alpha1.StateOpen, withApplyAction("x/v1", "widgets"), stale)
+			inc.ResourceVersion = "7"
+			var patches []string
+			k := newKube()
+			k.MockPatch = func(_ context.Context, _ client.Object, p client.Patch, _ ...client.PatchOption) error {
+				if p.Type() != types.MergePatchType {
+					t.Errorf("patch type %s, want %s", p.Type(), types.MergePatchType)
+				}
+				b, _ := p.Data(nil)
+				patches = append(patches, string(b))
+				if len(patches) <= tc.conflicts {
+					return conflict
+				}
+				return nil
+			}
+			reader := test.NewMockClient()
+			reader.MockGet = func(_ context.Context, _ client.ObjectKey, o client.Object) error {
+				tc.fresh().DeepCopyInto(o.(*v1alpha1.Incident))
+				return nil
+			}
+			e := newExternal(k, t0)
+			e.reader, e.episodes = reader, newEpisodes()
+			err := e.requestReanalysis(context.Background(), inc)
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("error = %v, want error %t", err, tc.wantErr)
+			}
+			if tc.wantPatches != nil {
+				if d := cmp.Diff(tc.wantPatches, patches); d != "" {
+					t.Errorf("patches (-want +got):\n%s", d)
+				}
+			}
+			if again := e.reanalysisDue(inc); !tc.wantErr && again && len(patches) > tc.conflicts {
+				t.Error("the episode is still due after its request")
 			}
 		})
 	}

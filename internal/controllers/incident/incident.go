@@ -7,6 +7,7 @@ package incident
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"sort"
@@ -87,7 +88,8 @@ func Setup(mgr ctrl.Manager, o Options) error {
 		// Alerts are read past the cache, one at a time: no informer on every Alert, and a
 		// missing Alert CRD is one failed read, not a cache that never syncs.
 		reconciler.WithExternalConnecter(&connector{kube: mgr.GetClient(), alerts: mgr.GetAPIReader(), cfg: cfg, pods: o.Pods,
-			runs: runs, alertReads: newLastRuns(), discovery: disc, targetReads: newTargetReads(), log: log, rec: rec}),
+			runs: runs, alertReads: newLastRuns(), discovery: disc, targetReads: newTargetReads(), reader: mgr.GetAPIReader(), episodes: newEpisodes(),
+			log: log, rec: rec}),
 		reconciler.WithPollInterval(cfg.PollInterval),
 		reconciler.WithPollIntervalHook(runs.pollIntervalHook),
 		reconciler.WithLogger(log),
@@ -176,8 +178,12 @@ type connector struct {
 	// discovery and targetReads read whether the cluster serves each applyAction's target.
 	discovery   discovery.DiscoveryInterface
 	targetReads *targetReads
-	log         logging.Logger
-	rec         event.Recorder
+	// reader reads an incident past the cache, to recheck a reanalysis request after a conflict;
+	// episodes are the ApplyActionStale episodes a reanalysis was requested for.
+	reader   client.Reader
+	episodes *episodes
+	log      logging.Logger
+	rec      event.Recorder
 }
 
 func (c *connector) Connect(_ context.Context, mg resource.Managed) (reconciler.ExternalClient, error) {
@@ -194,6 +200,8 @@ func (c *connector) Connect(_ context.Context, mg resource.Managed) (reconciler.
 		alertReads:  c.alertReads,
 		discovery:   c.discovery,
 		targetReads: c.targetReads,
+		reader:      c.reader,
+		episodes:    c.episodes,
 		log:         c.log.WithValues("incident", inc.Namespace+"/"+inc.Name),
 		rec:         c.rec,
 		now:         time.Now,
@@ -212,6 +220,9 @@ type plan struct {
 	from time.Time
 	// consumeApplied means spec.applied was acted on and goes back to false.
 	consumeApplied bool
+	// requestReanalysis means ApplyActionStale is True and its episode has no reanalysis yet: the
+	// controller sets spec.reanalysis.
+	requestReanalysis bool
 	// stale are the check pods to delete: finished ones, and those of a script no longer current.
 	stale []corev1.Pod
 	// live is the running check pod of the current script.
@@ -225,6 +236,9 @@ func (p plan) String() string {
 	}
 	if p.consumeApplied {
 		parts = append(parts, "spec.applied consumed")
+	}
+	if p.requestReanalysis {
+		parts = append(parts, "reanalysis to request")
 	}
 	if n := len(p.stale); n > 0 {
 		parts = append(parts, fmt.Sprintf("%d check pod(s) to delete", n))
@@ -244,6 +258,8 @@ type external struct {
 	alertReads  *lastRuns
 	discovery   discovery.DiscoveryInterface
 	targetReads *targetReads
+	reader      client.Reader
+	episodes    *episodes
 	log         logging.Logger
 	rec         event.Recorder
 	now         func() time.Time
@@ -269,6 +285,9 @@ func (e *external) Observe(ctx context.Context, mg resource.Managed) (reconciler
 		e.alertReads.forget(inc.UID)
 		if e.targetReads != nil {
 			e.targetReads.forget(inc.UID)
+		}
+		if e.episodes != nil {
+			e.episodes.forget(inc.UID)
 		}
 		// A deleted Incident is Deleting. provider-runtime sets that itself while it deletes, after
 		// a successful Observe and after a failed one (v1.8.2), so this write is not required;
@@ -311,11 +330,12 @@ func (e *external) Observe(ctx context.Context, mg resource.Managed) (reconciler
 	e.plan.dirty = consumed || !equality.Semantic.DeepEqual(before, &inc.Status)
 	lastRun := e.runs.get(inc.UID)
 	e.plan.due = e.plan.live == nil && checkDue(inc, e.cfg, lastRun, now)
+	e.plan.requestReanalysis = e.reanalysisDue(inc)
 	e.plan.from = checkFrom(inc, lastRun)
 
 	inc.SetConditions(prv1.Available())
 
-	if e.plan.dirty || len(e.plan.stale) > 0 || e.plan.due {
+	if e.plan.dirty || len(e.plan.stale) > 0 || e.plan.due || e.plan.requestReanalysis {
 		return reconciler.ExternalObservation{ResourceExists: true, ResourceUpToDate: false, Diff: e.plan.String()}, nil
 	}
 	return reconciler.ExternalObservation{ResourceExists: true, ResourceUpToDate: true}, nil
@@ -353,6 +373,11 @@ func (e *external) Update(ctx context.Context, mg resource.Managed) error {
 	for i := range e.plan.stale {
 		if err := e.kube.Delete(ctx, &e.plan.stale[i], client.PropagationPolicy("Background")); resource.IgnoreNotFound(err) != nil {
 			return fmt.Errorf("cannot delete check pod %s: %w", e.plan.stale[i].Name, err)
+		}
+	}
+	if e.plan.requestReanalysis {
+		if err := e.requestReanalysis(ctx, inc); err != nil {
+			return err
 		}
 	}
 	if e.plan.due {
@@ -463,6 +488,67 @@ func (e *external) readApplyTarget(inc *v1alpha1.Incident, now time.Time) *apply
 	e.targetReads.seen(inc.UID, target, now)
 	return &t
 }
+
+// reanalysisDue reports whether the controller should request a reanalysis of inc for its
+// ApplyActionStale episode, and has not already in this process.
+func (e *external) reanalysisDue(inc *v1alpha1.Incident) bool {
+	if e.episodes == nil || !staleReanalysisDue(inc) {
+		return false
+	}
+	return !e.episodes.requested(inc.UID, inc.GetCondition(v1alpha1.TypeApplyActionStale).LastTransitionTime.Time)
+}
+
+// maxRequestAttempts bounds the conflicts requestReanalysis retries.
+const maxRequestAttempts = 3
+
+// requestReanalysis sets spec.reanalysis to the controller's request, cause ApplyActionStale. It
+// runs after the status write that made ApplyActionStale True, so the episode the request answers
+// is persisted first. It patches spec.reanalysis alone, with a JSON merge patch that carries the
+// resourceVersion read: a write in between, such as a person's request, makes it conflict, and the
+// incident is read again and the guards checked again before another attempt.
+func (e *external) requestReanalysis(ctx context.Context, inc *v1alpha1.Incident) error {
+	cur := inc
+	for range maxRequestAttempts {
+		if !e.reanalysisDue(cur) {
+			return nil
+		}
+		episode := cur.GetCondition(v1alpha1.TypeApplyActionStale)
+		patch, err := json.Marshal(map[string]any{
+			"metadata": map[string]any{"resourceVersion": cur.ResourceVersion},
+			"spec": map[string]any{"reanalysis": v1alpha1.ReanalysisRequest{
+				Cause:    v1alpha1.ReanalysisCauseApplyActionStale,
+				Feedback: v1alpha1.ReanalysisFeedbackApplyActionStale,
+			}},
+		})
+		if err != nil {
+			return fmt.Errorf("cannot encode the reanalysis request: %w", err)
+		}
+		// The patch's response refreshes cur. When cur is inc, the reconciler's next status write
+		// carries the new resourceVersion; after a conflict, inc keeps its old one and that write
+		// conflicts and is retried, never overwriting what was read.
+		err = e.kube.Patch(ctx, cur, client.RawPatch(types.MergePatchType, patch))
+		if err == nil {
+			e.episodes.request(cur.UID, episode.LastTransitionTime.Time)
+			msg := "requested a reanalysis, cause ApplyActionStale: " + episode.Message
+			e.rec.Event(cur, event.Normal(event.Reason(reasonReanalysisRequested), actionReconcile, msg))
+			e.log.Info(msg, "reason", reasonReanalysisRequested, "cause", string(v1alpha1.ReanalysisCauseApplyActionStale),
+				"state", string(cur.Status.State))
+			return nil
+		}
+		if !apierrors.IsConflict(err) {
+			return fmt.Errorf("cannot request a reanalysis: %w", err)
+		}
+		fresh := &v1alpha1.Incident{}
+		if err := e.reader.Get(ctx, client.ObjectKeyFromObject(cur), fresh); err != nil {
+			return fmt.Errorf("cannot read the incident again to request a reanalysis: %w", err)
+		}
+		cur = fresh
+	}
+	return fmt.Errorf("cannot request a reanalysis: %d conflicting writes", maxRequestAttempts)
+}
+
+// reasonReanalysisRequested is the Event and log reason of the controller's reanalysis request.
+const reasonReanalysisRequested = "ReanalysisRequested"
 
 // startCheck creates the check pod, then the ConfigMap with its script, owned by the pod. The
 // kubelet waits for the ConfigMap before it starts the container.

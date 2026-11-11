@@ -46,7 +46,7 @@ kubectl get incidents -n krateo-system -l observability.krateo.io/alert=composit
 | `triggeredAt` | date-time | writer | when the opening firing arrived |
 | `applied` | bool | human: "I applied it", or the portal's Apply; reset by the controller | the apply script ran. The controller consumes it: it moves Open to Verifying, records an `apply` result and sets `applied` back to `false` |
 | `closed` | bool | human: the portal's Close; the writer, closing a failed analysis | moves any state to Closed. The writer sets it with the annotation `observability.krateo.io/closed-reason: analysis-failed` in one patch (see `resolution.by`) |
-| `reanalysis` | `{feedback}` | human: the portal's Re-run analysis; removed by the writer | asks for a new analysis of an `Open` or `Verifying` incident. The writer consumes it: it records it in `status.reanalysis`, moves the incident back to `Analyzing`, removes the field and runs the analysis again with the previous one, the checks' results and `feedback` (at most 2000 characters). In any other state it is removed unanswered |
+| `reanalysis` | `{cause, feedback}` | human: the portal's Re-run analysis, `cause: Person`; the controller, `cause: ApplyActionStale` (see [ApplyActionStale](#the-applyactionstale-condition)); removed by the writer | asks for a new analysis of an `Open` or `Verifying` incident. `cause` is `Person` (the default: the apiserver sets it on a request without one) or `ApplyActionStale`. The writer consumes it: it records it in `status.reanalysis`, moves the incident back to `Analyzing`, removes the field and runs the analysis again with the previous one, the checks' results and `feedback` (at most 2000 characters). In any other state it is removed unanswered |
 
 ## status
 
@@ -89,7 +89,7 @@ The root-cause analysis, written by the writer:
 | `assumptions[]` | string | what it assumed for lack of it |
 | `error` | string | why the analysis failed |
 | `completedAt` | date-time | when the analysis finished |
-| `reanalysis` | `{at, feedback, count}` | the latest `spec.reanalysis` the writer consumed: when, its feedback, and how many reanalyses the incident has had |
+| `reanalysis` | `{at, cause, feedback, count}` | the latest `spec.reanalysis` the writer consumed: when, its cause (`Person`, the default, or `ApplyActionStale`), its feedback, and how many reanalyses the incident has had |
 
 A reanalysis clears every field above, `howToFix`, `lastChecks`,
 `verifyingSince` and the `Reproduced` condition before the new analysis runs:
@@ -158,10 +158,44 @@ strings and joined with `, ` (e.g. `served: v0-1-26, v0-1-28`), or `none` for
   of served versions changes the message alone.
 - A discovery read that fails for another reason than NotFound changes
   nothing; it is retried at the next reconcile.
-- It is absent while there is no `applyAction`, and removed when
-  `applyAction` goes.
+- It is absent while there is no `applyAction`, and removed when an `Open`
+  or `Verifying` incident has none. In the other states it is left as it is:
+  a reanalysis (`Analyzing`) clears `howToFix`, and the condition outlives
+  it, so the new analysis continues the episode.
 - The controller never rewrites `applyAction`: its `payload` is written
   against the schema of the version it names. A reanalysis replaces it.
+
+### The automatic reanalysis
+
+An episode of the condition is the time since it last became `True`
+(`lastTransitionTime`). In each episode the controller asks for one
+reanalysis itself: it sets
+
+```yaml
+spec:
+  reanalysis:
+    cause: ApplyActionStale
+    feedback: applyAction targets a version this cluster no longer serves
+```
+
+when the incident is `Open` or `Verifying` and `ApplyActionStale` is `True`,
+unless
+
+- `spec.reanalysis` is already set: a pending request, a person's, wins and
+  is left as it is;
+- `status.reanalysis.at` is at or after the condition's `lastTransitionTime`:
+  a reanalysis was consumed in this episode, so it is answered.
+
+A new analysis that targets an unserved version again keeps the condition
+`True`, with the same `lastTransitionTime`: no second request. The target
+served, then unserved again, starts a new episode, which asks again. The
+controller also remembers, in memory, the episodes it asked for, so a request
+the writer drops unanswered is not repeated until the controller restarts.
+
+It writes the request with a JSON merge patch of `spec.reanalysis` alone that
+carries the `resourceVersion` it read; on a conflict it reads the incident
+again and checks the conditions above again. Each request is an Event and a
+log line with reason `ReanalysisRequested`.
 
 ## Rules the apiserver enforces
 
@@ -209,6 +243,7 @@ reason `ApplyFinished`, its message starting with the phase
   `v1alpha1.IncidentList` its `resource.ManagedList`.
 - `v1alpha1.IncidentApply` satisfies `resource.Managed` too.
 - Constants: `RequesterPolicy`, `MaxApplyOutput`, `ReasonApplyFinished`, the `Apply*` phases, `LabelAlert`, the `State*`, `Script*`, `ResolvedBy*`,
-  `Trigger*`, `Source*`, `Category*`, `Owner*` and `OwnerEvidence*` values, `TypeReproduced`,
+  `Trigger*`, `Source*`, `Category*`, `Owner*`, `OwnerEvidence*` and `ReanalysisCause*` values,
+  `ReanalysisFeedbackApplyActionStale`, `TypeReproduced`,
   `TypeChecksUnknown`, `TypeAlertGone`, `TypeApplyActionStale` and their reasons.
 - `apis.AddToScheme` registers the group.
