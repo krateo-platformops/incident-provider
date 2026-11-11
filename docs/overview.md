@@ -105,6 +105,19 @@ been `True` for the alert-gone grace, the incident is `Closed` with
 problem gone. A missing Alert CRD, a denied read or an unreachable apiserver
 change nothing.
 
+### Apply target not served
+
+While `Open` or `Verifying`, the controller reads from API discovery whether
+the cluster serves the `apiVersion` and `resource` of `howToFix.applyAction`,
+once a poll interval, and sets `ApplyActionStale` (see
+[the API](./api.md#the-applyactionstale-condition)). A composition's CRD
+stops serving old versions as its chart is upgraded, so an analysis written
+against one goes stale. The controller only reports it: the payload is bound
+to the old version's schema, and a reanalysis writes a new `applyAction`. It
+reads discovery uncached: the manager's RESTMapper learns new versions but
+keeps answering for one the cluster no longer serves. A failed read changes
+nothing.
+
 ### Closed by the writer
 
 The writer closes an incident whose analysis failed (no scripts that can run)
@@ -208,6 +221,8 @@ with the attributes `incident` (`namespace/name`) and `reason`:
 | `StateChanged` | `from`, `to`, `why` | every state transition the controller makes; the message is `‹from› -> ‹to›: ‹why›` |
 | `ChecksUnknown` | `state`, `script`, `exit`, `runs` | a script hit the no-verdict bound and stopped |
 | `AlertGone` | `state`, `alert` | the Alert in `spec.alertRef` was first found missing |
+| `ApplyActionStale` | `state`, `apiVersion`, `resource` | `ApplyActionStale` became `True`: the cluster does not serve the target of `howToFix.applyAction`; the message is the condition's |
+| `ApplyActionServed` | `state`, `apiVersion`, `resource` | `ApplyActionStale` went from `True` to `False` |
 
 To alert on stuck incidents, match `ChecksUnknown=True` on the Incident, or
 the `ChecksUnknown` log line; for incidents left `Open` too long, compare the

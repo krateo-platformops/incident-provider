@@ -20,6 +20,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/discovery"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
@@ -51,6 +52,10 @@ type Options struct {
 	// Checks is the check cadence; its PollInterval is taken from Controller.
 	Checks Config
 	Pods   CheckPods
+	// Discovery reads whether the cluster serves the target of an applyAction. Nil: a discovery
+	// client of the manager's config. It is never cached: the manager's RESTMapper only learns
+	// new versions, and keeps answering for a version the cluster stopped serving.
+	Discovery discovery.DiscoveryInterface
 }
 
 // Setup adds the Incident controller to the manager.
@@ -68,12 +73,21 @@ func Setup(mgr ctrl.Manager, o Options) error {
 	cfg.PollInterval = o.Controller.PollInterval
 	runs := newLastRuns()
 
+	disc := o.Discovery
+	if disc == nil {
+		d, err := discovery.NewDiscoveryClientForConfigAndClient(mgr.GetConfig(), mgr.GetHTTPClient())
+		if err != nil {
+			return fmt.Errorf("failed to create discovery client: %w", err)
+		}
+		disc = d
+	}
+
 	r := reconciler.NewReconciler(mgr,
 		resource.ManagedKind(v1alpha1.IncidentGroupVersionKind),
 		// Alerts are read past the cache, one at a time: no informer on every Alert, and a
 		// missing Alert CRD is one failed read, not a cache that never syncs.
 		reconciler.WithExternalConnecter(&connector{kube: mgr.GetClient(), alerts: mgr.GetAPIReader(), cfg: cfg, pods: o.Pods,
-			runs: runs, alertReads: newLastRuns(), log: log, rec: rec}),
+			runs: runs, alertReads: newLastRuns(), discovery: disc, targetReads: newTargetReads(), log: log, rec: rec}),
 		reconciler.WithPollInterval(cfg.PollInterval),
 		reconciler.WithPollIntervalHook(runs.pollIntervalHook),
 		reconciler.WithLogger(log),
@@ -159,8 +173,11 @@ type connector struct {
 	runs   *lastRuns
 	// alertReads is when each incident's Alert was last read.
 	alertReads *lastRuns
-	log        logging.Logger
-	rec        event.Recorder
+	// discovery and targetReads read whether the cluster serves each applyAction's target.
+	discovery   discovery.DiscoveryInterface
+	targetReads *targetReads
+	log         logging.Logger
+	rec         event.Recorder
 }
 
 func (c *connector) Connect(_ context.Context, mg resource.Managed) (reconciler.ExternalClient, error) {
@@ -169,15 +186,17 @@ func (c *connector) Connect(_ context.Context, mg resource.Managed) (reconciler.
 		return nil, errNotIncident
 	}
 	return &external{
-		kube:       c.kube,
-		alerts:     c.alerts,
-		cfg:        c.cfg,
-		pods:       c.pods,
-		runs:       c.runs,
-		alertReads: c.alertReads,
-		log:        c.log.WithValues("incident", inc.Namespace+"/"+inc.Name),
-		rec:        c.rec,
-		now:        time.Now,
+		kube:        c.kube,
+		alerts:      c.alerts,
+		cfg:         c.cfg,
+		pods:        c.pods,
+		runs:        c.runs,
+		alertReads:  c.alertReads,
+		discovery:   c.discovery,
+		targetReads: c.targetReads,
+		log:         c.log.WithValues("incident", inc.Namespace+"/"+inc.Name),
+		rec:         c.rec,
+		now:         time.Now,
 	}, nil
 }
 
@@ -217,16 +236,18 @@ func (p plan) String() string {
 }
 
 type external struct {
-	kube       client.Client
-	alerts     client.Reader
-	cfg        Config
-	pods       CheckPods
-	runs       *lastRuns
-	alertReads *lastRuns
-	log        logging.Logger
-	rec        event.Recorder
-	now        func() time.Time
-	plan       plan
+	kube        client.Client
+	alerts      client.Reader
+	cfg         Config
+	pods        CheckPods
+	runs        *lastRuns
+	alertReads  *lastRuns
+	discovery   discovery.DiscoveryInterface
+	targetReads *targetReads
+	log         logging.Logger
+	rec         event.Recorder
+	now         func() time.Time
+	plan        plan
 }
 
 // Observe reads the incident's check pods, records the finished ones and applies the resulting
@@ -246,6 +267,9 @@ func (e *external) Observe(ctx context.Context, mg resource.Managed) (reconciler
 	if meta.WasDeleted(inc) {
 		e.runs.forget(inc.UID)
 		e.alertReads.forget(inc.UID)
+		if e.targetReads != nil {
+			e.targetReads.forget(inc.UID)
+		}
 		// A deleted Incident is Deleting. provider-runtime sets that itself while it deletes, after
 		// a successful Observe and after a failed one (v1.8.2), so this write is not required;
 		// it keeps every successful Observe answering Ready.
@@ -258,6 +282,7 @@ func (e *external) Observe(ctx context.Context, mg resource.Managed) (reconciler
 	changes, consumed := applySpec(inc, now)
 	e.plan = plan{changes: changes, consumeApplied: consumed}
 	e.plan.changes = append(e.plan.changes, observeAlert(inc, e.cfg, e.readAlert(ctx, inc, now), now)...)
+	e.plan.changes = append(e.plan.changes, observeApplyAction(inc, e.readApplyTarget(inc, now), now)...)
 
 	sort.Slice(pods, func(i, j int) bool { return pods[i].CreationTimestamp.Before(&pods[j].CreationTimestamp) })
 	for i := range pods {
@@ -410,6 +435,33 @@ func alertNotFoundErr(err error, name string) bool {
 	}
 	s := st.Status()
 	return s.Reason == metav1.StatusReasonNotFound && s.Details != nil && s.Details.Name == name
+}
+
+// readApplyTarget reads from discovery whether the cluster serves the target of an Open or
+// Verifying incident's applyAction, the states in which the portal can send it: at most once a
+// poll interval for the same target, and at once for a new one. nil: it was not read. A failed
+// read is logged and not counted, so the next reconcile reads again; it changes no state, like a
+// check that gives no verdict.
+func (e *external) readApplyTarget(inc *v1alpha1.Incident, now time.Time) *applyTarget {
+	a := applyActionOf(inc)
+	if a == nil || e.discovery == nil || e.targetReads == nil {
+		return nil
+	}
+	if s := inc.Status.State; s != v1alpha1.StateOpen && s != v1alpha1.StateVerifying {
+		return nil
+	}
+	target := a.APIVersion + " " + a.Resource
+	if !e.targetReads.due(inc.UID, target, now, e.cfg.PollInterval) {
+		return nil
+	}
+	t, err := lookupApplyTarget(e.discovery, a.APIVersion, a.Resource)
+	if err != nil {
+		e.log.Info("cannot read whether the cluster serves the applyAction target; ApplyActionStale unchanged",
+			"apiVersion", a.APIVersion, "resource", a.Resource, "error", err.Error())
+		return nil
+	}
+	e.targetReads.seen(inc.UID, target, now)
+	return &t
 }
 
 // startCheck creates the check pod, then the ConfigMap with its script, owned by the pod. The

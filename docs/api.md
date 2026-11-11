@@ -67,7 +67,7 @@ Lifecycle and checks:
 | `verifyingSince` | date-time | controller | the start of the settle window: when the incident entered `Verifying`, or was applied again while `Verifying`. Set only while `Verifying` |
 | `resolution.by` | `verify` \| `user` \| `alert-gone` \| `analysis-failed`, required | controller | `verify` with `Resolved`; `user`, `alert-gone` or `analysis-failed` with `Closed`. `alert-gone`: the Alert in `spec.alertRef` was deleted. `analysis-failed`: the writer closed the incident because its analysis failed: `spec.closed` carries the annotation `observability.krateo.io/closed-reason: analysis-failed`, and the field managers that own `spec.closed` all own that annotation too (see [overview](./overview.md#closed-by-the-writer)). Any other `spec.closed` is `user` |
 | `resolution.at` | date-time, required | controller | when the incident ended |
-| `conditions[]` | provider-runtime `Condition` | controller | `Ready` and `Synced` from provider-runtime, plus `Reproduced`, `ChecksUnknown` and `AlertGone` below |
+| `conditions[]` | provider-runtime `Condition` | controller | `Ready` and `Synced` from provider-runtime, plus `Reproduced`, `ChecksUnknown`, `AlertGone` and `ApplyActionStale` below |
 
 Any other exit code, and a timeout, is unknown: it is recorded and changes no
 state; too many in a row stop the script (`ChecksUnknown`).
@@ -127,6 +127,42 @@ It is absent until a script hits the bound.
 It is read only while `Open` or `Verifying`, and is absent while the Alert has
 always been found.
 
+## The ApplyActionStale condition
+
+Whether this cluster serves the `apiVersion` and `resource` that
+`howToFix.applyAction` targets, read from API discovery:
+
+| Status | Reason | Meaning |
+|---|---|---|
+| `True` | `VersionNotServed` | the resource is served, but not at `applyAction.apiVersion`: the portal's Apply would fail |
+| `True` | `ResourceNotFound` | the resource is served at no version of its group (or the group is not served, or `apiVersion` does not parse) |
+| `False` | `Served` | the target is served |
+
+The `True` message has a fixed format, for agents to match:
+
+```
+applyAction targets <apiVersion> <resource>, which this cluster does not serve; served: <versions>
+```
+
+`<versions>` are the versions of the group that serve the resource, sorted as
+strings and joined with `, ` (e.g. `served: v0-1-26, v0-1-28`), or `none` for
+`ResourceNotFound`. The `False` message is `applyAction targets <apiVersion>
+<resource>, which this cluster serves`.
+
+- It is read while `Open` or `Verifying`, the states in which Apply can be
+  sent: once a poll interval, and at once when `applyAction` names another
+  target. It is read from discovery each time, never from a cache, so a
+  version the cluster stops serving is seen at the next read, and a newly
+  served one too.
+- `lastTransitionTime` changes only when the status flips: a different list
+  of served versions changes the message alone.
+- A discovery read that fails for another reason than NotFound changes
+  nothing; it is retried at the next reconcile.
+- It is absent while there is no `applyAction`, and removed when
+  `applyAction` goes.
+- The controller never rewrites `applyAction`: its `payload` is written
+  against the schema of the version it names. A reanalysis replaces it.
+
 ## Rules the apiserver enforces
 
 | Rule | Message |
@@ -173,6 +209,6 @@ reason `ApplyFinished`, its message starting with the phase
   `v1alpha1.IncidentList` its `resource.ManagedList`.
 - `v1alpha1.IncidentApply` satisfies `resource.Managed` too.
 - Constants: `RequesterPolicy`, `MaxApplyOutput`, `ReasonApplyFinished`, the `Apply*` phases, `LabelAlert`, the `State*`, `Script*`, `ResolvedBy*`,
-  `Trigger*` and `Source*` values, `TypeReproduced`, `TypeChecksUnknown`, `TypeAlertGone` and
-  their reasons.
+  `Trigger*`, `Source*`, `Category*`, `Owner*` and `OwnerEvidence*` values, `TypeReproduced`,
+  `TypeChecksUnknown`, `TypeAlertGone`, `TypeApplyActionStale` and their reasons.
 - `apis.AddToScheme` registers the group.

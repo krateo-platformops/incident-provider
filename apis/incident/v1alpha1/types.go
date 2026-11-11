@@ -183,6 +183,26 @@ const (
 	ReasonAlertFound    prv1.ConditionReason = "AlertFound"
 )
 
+// TypeApplyActionStale is a condition on status.howToFix.applyAction, read from API discovery
+// while the incident is Open or Verifying: whether this cluster serves the apiVersion and
+// resource it targets. True: it does not, so the portal's Apply would fail; the message is
+// "applyAction targets <apiVersion> <resource>, which this cluster does not serve; served:
+// <versions>", with the versions that serve the resource sorted and comma-separated, or "none".
+// The controller never rewrites applyAction: its payload is written against the schema of the
+// version it names, so only a reanalysis replaces it. False: the target is served. Absent while
+// there is no applyAction. A failed discovery read changes nothing.
+const TypeApplyActionStale prv1.ConditionType = "ApplyActionStale"
+
+// Reasons of the ApplyActionStale condition.
+const (
+	// ReasonVersionNotServed: True, the resource is served, at other versions only.
+	ReasonVersionNotServed prv1.ConditionReason = "VersionNotServed"
+	// ReasonResourceNotFound: True, the resource is served at no version.
+	ReasonResourceNotFound prv1.ConditionReason = "ResourceNotFound"
+	// ReasonServed: False, the target is served.
+	ReasonServed prv1.ConditionReason = "Served"
+)
+
 // AlertRef locates the Alert that opened an Incident.
 type AlertRef struct {
 	// Name of the Alert. It is also the value of the observability.krateo.io/alert label, so it is

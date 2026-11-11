@@ -8,6 +8,11 @@ IMAGE ?= ghcr.io/krateo-platformops/incident-provider
 CHECK_IMAGE ?= ghcr.io/krateo-platformops/incident-provider-check
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 
+# The control plane of the real-API-server tests (build tag integration). setup-envtest is pinned
+# to the head of controller-runtime's release-0.23 branch, the controller-runtime in go.mod.
+ENVTEST_K8S_VERSION ?= 1.35.x
+SETUP_ENVTEST ?= go run sigs.k8s.io/controller-runtime/tools/setup-envtest@v0.0.0-20260305142021-f9589b9f2b9d
+
 .PHONY: help
 help: ## print this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "\033[36m%-16s\033[0m %s\n", $$1, $$2}'
@@ -30,9 +35,14 @@ build: ## build all packages
 test: ## run unit tests
 	go test -race -cover ./...
 
+.PHONY: test-integration
+test-integration: ## run the real-API-server (envtest) tests
+	KUBEBUILDER_ASSETS="$$($(SETUP_ENVTEST) use $(ENVTEST_K8S_VERSION) -p path)" \
+	  go test -race -count=1 -tags integration -run Envtest ./...
+
 .PHONY: lint
-lint: ## run go vet
-	go vet ./...
+lint: ## run go vet, the integration tests included
+	go vet -tags integration ./...
 
 .PHONY: lint-charts
 lint-charts: ## helm lint and render every chart, with CHART_VERSION set to 0.0.0
@@ -52,4 +62,4 @@ image-check: ## build the check pod image
 	docker build -t $(CHECK_IMAGE):$(VERSION) check
 
 .PHONY: check
-check: build lint test check-generate lint-charts ## everything CI runs
+check: build lint test test-integration check-generate lint-charts ## everything CI runs
