@@ -215,6 +215,12 @@ func TestStaleReanalysisDue(t *testing.T) {
 		{name: "Analyzing", inc: newIncident(v1alpha1.StateAnalyzing, stale)},
 		{name: "Resolved", inc: newIncident(v1alpha1.StateResolved, stale)},
 		{name: "Closed", inc: newIncident(v1alpha1.StateClosed, stale)},
+		{name: "a person analyzes it: the writer would drop the request", inc: newIncident(v1alpha1.StateOpen, stale, func(i *v1alpha1.Incident) {
+			i.Labels = map[string]string{v1alpha1.LabelAnalysis: v1alpha1.AnalysisHuman}
+		})},
+		{name: "another analysis label: due", inc: newIncident(v1alpha1.StateOpen, stale, func(i *v1alpha1.Incident) {
+			i.Labels = map[string]string{v1alpha1.LabelAnalysis: "agent"}
+		}), want: true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -286,7 +292,7 @@ func TestRequestReanalysis(t *testing.T) {
 				return nil
 			}
 			e := newExternal(k, t0)
-			e.reader, e.episodes = reader, newEpisodes()
+			e.reader = reader
 			err := e.requestReanalysis(context.Background(), inc)
 			if (err != nil) != tc.wantErr {
 				t.Fatalf("error = %v, want error %t", err, tc.wantErr)
@@ -295,9 +301,6 @@ func TestRequestReanalysis(t *testing.T) {
 				if d := cmp.Diff(tc.wantPatches, patches); d != "" {
 					t.Errorf("patches (-want +got):\n%s", d)
 				}
-			}
-			if again := e.reanalysisDue(inc); !tc.wantErr && again && len(patches) > tc.conflicts {
-				t.Error("the episode is still due after its request")
 			}
 		})
 	}

@@ -21,6 +21,14 @@ const (
 // alert's namespace.
 const LabelAlert = "observability.krateo.io/alert"
 
+// LabelAnalysis, with the value AnalysisHuman, marks an incident that a person analyzes, not the
+// writer's agent. The writer (alert-provider) copies it from the Alert, and drops a reanalysis
+// request on such an incident unanswered, so the controller never files one there.
+const (
+	LabelAnalysis = "observability.krateo.io/analysis"
+	AnalysisHuman = "human"
+)
+
 // State is the lifecycle state of an Incident.
 // +kubebuilder:validation:Enum=Analyzing;Open;Verifying;Resolved;Closed
 type State string

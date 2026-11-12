@@ -34,6 +34,13 @@ func TestStaleReanalysisEnvtest(t *testing.T) {
 	openWith(ctx, t, kube, auto, "v1")
 	person := newEnvIncident(ctx, t, kube, "person", personReq)
 	openWith(ctx, t, kube, person, "v1")
+	// A person analyzes it: alert-provider would drop a request on it unanswered.
+	human := newEnvIncident(ctx, t, kube, "human", nil)
+	patchSpec(ctx, t, kube, human, `{"metadata":{"labels":{"`+v1alpha1.LabelAnalysis+`":"`+v1alpha1.AnalysisHuman+`"}}}`)
+	openWith(ctx, t, kube, human, "v1")
+	// Its request will race with a state change.
+	race := newEnvIncident(ctx, t, kube, "race", nil)
+	openWith(ctx, t, kube, race, "v1")
 
 	// Incidents that already carry ApplyActionStale=True, in states that take no request.
 	others := map[v1alpha1.State]*v1alpha1.Incident{}
@@ -92,6 +99,43 @@ func TestStaleReanalysisEnvtest(t *testing.T) {
 			if r := get(ctx, t, kube, inc).Spec.Reanalysis; r != nil {
 				t.Errorf("%s: spec.reanalysis = %+v, want none", state, r)
 			}
+		}
+	})
+
+	t.Run("no request on an incident a person analyzes", func(t *testing.T) {
+		waitFor(ctx, t, kube, human, "True", isStale)
+		holds(t, 3*poll, func() string {
+			if r := get(ctx, t, kube, human).Spec.Reanalysis; r != nil {
+				return "spec.reanalysis set on a human-analysis incident"
+			}
+			return ""
+		})
+		if n := requestEvents(ctx, t, kube, human); n != 0 {
+			t.Errorf("%d ReanalysisRequested events, want none", n)
+		}
+	})
+
+	t.Run("a request dropped in a race is not filed again", func(t *testing.T) {
+		eventuallyReanalysis(ctx, t, kube, race, autoReq)
+		// Before alert-provider consumes the request, the incident is Resolved; alert-provider
+		// then drops the request unanswered, leaving status.reanalysis as it was.
+		writeStatus(ctx, t, kube, race, func(st *v1alpha1.IncidentStatus) {
+			st.State = v1alpha1.StateResolved
+			st.Resolution = &v1alpha1.Resolution{By: v1alpha1.ResolvedByVerify, At: metav1.NewTime(time.Now()).Rfc3339Copy()}
+		})
+		patchSpec(ctx, t, kube, race, `{"spec":{"reanalysis":null}}`)
+		holds(t, 4*poll, func() string {
+			inc := get(ctx, t, kube, race)
+			if inc.Spec.Reanalysis != nil {
+				return "the dropped request was filed again"
+			}
+			if inc.Status.Reanalysis != nil {
+				return "status.reanalysis set: the drop answered nothing"
+			}
+			return ""
+		})
+		if n := requestEvents(ctx, t, kube, race); n != 1 {
+			t.Errorf("%d ReanalysisRequested events, want 1", n)
 		}
 	})
 

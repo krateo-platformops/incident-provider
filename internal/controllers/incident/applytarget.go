@@ -216,12 +216,15 @@ func (r *targetReads) forget(uid types.UID) {
 }
 
 // staleReanalysisDue reports whether the incident's ApplyActionStale episode calls for the
-// controller's reanalysis request: the incident is Open or Verifying, ApplyActionStale is True, no
-// request is pending (a person's wins), and no reanalysis was consumed since the condition became
-// True (the episode is answered). A new analysis that targets an unserved version again keeps the
-// condition True, so its episode is still answered: there is one request per episode.
+// controller's reanalysis request: the writer would answer a request (writerAnswers),
+// ApplyActionStale is True, no request is pending (a person's wins), and no reanalysis was
+// consumed since the condition became True (the episode is answered). A new analysis that
+// targets an unserved version again keeps the condition True, so its episode is still answered:
+// there is one request per episode. A request the writer drops unanswered can only come from a
+// race, the state changing between the request and its consumption; the incident is then no
+// longer one the writer answers, so nothing is filed again.
 func staleReanalysisDue(inc *v1alpha1.Incident) bool {
-	if s := inc.Status.State; s != v1alpha1.StateOpen && s != v1alpha1.StateVerifying {
+	if !writerAnswers(inc) {
 		return false
 	}
 	c := inc.GetCondition(v1alpha1.TypeApplyActionStale)
@@ -234,34 +237,15 @@ func staleReanalysisDue(inc *v1alpha1.Incident) bool {
 	return true
 }
 
-// episodes is, per incident, the ApplyActionStale episode (its lastTransitionTime) the controller
-// last requested a reanalysis for. Held in memory only. It bounds the requests of an episode to
-// one per process even when the writer drops a request without answering it (in a state or for an
-// incident it does not reanalyze), which leaves status.reanalysis unchanged.
-type episodes struct {
-	mu sync.Mutex
-	at map[types.UID]time.Time
-}
-
-func newEpisodes() *episodes {
-	return &episodes{at: map[types.UID]time.Time{}}
-}
-
-func (e *episodes) requested(uid types.UID, episode time.Time) bool {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	at, ok := e.at[uid]
-	return ok && at.Equal(episode)
-}
-
-func (e *episodes) request(uid types.UID, episode time.Time) {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	e.at[uid] = episode
-}
-
-func (e *episodes) forget(uid types.UID) {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	delete(e.at, uid)
+// writerAnswers reports whether the writer would answer a reanalysis request on inc rather than
+// drop it: inc is Open or Verifying and no person analyzes it. It mirrors alert-provider's
+// Writer.Reanalyze (internal/incident/reanalysis.go at a469b1a), which removes the request
+// unanswered (dropRequest) from an incident labelled LabelAnalysis=AnalysisHuman or in any other
+// state.
+func writerAnswers(inc *v1alpha1.Incident) bool {
+	if inc.Labels[v1alpha1.LabelAnalysis] == v1alpha1.AnalysisHuman {
+		return false
+	}
+	s := inc.Status.State
+	return s == v1alpha1.StateOpen || s == v1alpha1.StateVerifying
 }

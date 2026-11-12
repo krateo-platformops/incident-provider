@@ -25,6 +25,7 @@ A sample with every field is [`examples/incident`](../examples/incident/README.m
 | Name | `‹alert name›-‹yyyymmdd-hhmmss›` of the opening firing, one object per incident |
 | Namespace | the Alert's namespace, `spec.alertRef.namespace` |
 | Label | `observability.krateo.io/alert: ‹spec.alertRef.name›`, set by the writer at creation |
+| Label | `observability.krateo.io/analysis: human`, copied by the writer from the Alert: a person analyzes the incident. The writer drops reanalysis requests on it, so the controller files none |
 
 List one alert's incidents with the label, in the alert's namespace:
 
@@ -178,8 +179,11 @@ spec:
     feedback: applyAction targets a version this cluster no longer serves
 ```
 
-when the incident is `Open` or `Verifying` and `ApplyActionStale` is `True`,
-unless
+when `ApplyActionStale` is `True` on an incident the writer would answer a
+request on: `Open` or `Verifying`, and not labelled
+`observability.krateo.io/analysis: human` (a person analyzes it). This is
+alert-provider's own rule (`Writer.Reanalyze`); it drops a request on any
+other incident unanswered. It does not ask when
 
 - `spec.reanalysis` is already set: a pending request, a person's, wins and
   is left as it is;
@@ -188,9 +192,11 @@ unless
 
 A new analysis that targets an unserved version again keeps the condition
 `True`, with the same `lastTransitionTime`: no second request. The target
-served, then unserved again, starts a new episode, which asks again. The
-controller also remembers, in memory, the episodes it asked for, so a request
-the writer drops unanswered is not repeated until the controller restarts.
+served, then unserved again, starts a new episode, which asks again. Since
+the controller asks only where the writer answers, a request can be dropped
+unanswered only in a race: the incident changes state between the request and
+its consumption. It is then in a state the controller does not ask in, so the
+request is not filed again.
 
 It writes the request with a JSON merge patch of `spec.reanalysis` alone that
 carries the `resourceVersion` it read; on a conflict it reads the incident
@@ -242,7 +248,7 @@ reason `ApplyFinished`, its message starting with the phase
 - `v1alpha1.Incident` satisfies provider-runtime's `resource.Managed`,
   `v1alpha1.IncidentList` its `resource.ManagedList`.
 - `v1alpha1.IncidentApply` satisfies `resource.Managed` too.
-- Constants: `RequesterPolicy`, `MaxApplyOutput`, `ReasonApplyFinished`, the `Apply*` phases, `LabelAlert`, the `State*`, `Script*`, `ResolvedBy*`,
+- Constants: `RequesterPolicy`, `MaxApplyOutput`, `ReasonApplyFinished`, the `Apply*` phases, `LabelAlert`, `LabelAnalysis` and `AnalysisHuman`, the `State*`, `Script*`, `ResolvedBy*`,
   `Trigger*`, `Source*`, `Category*`, `Owner*`, `OwnerEvidence*` and `ReanalysisCause*` values,
   `ReanalysisFeedbackApplyActionStale`, `TypeReproduced`,
   `TypeChecksUnknown`, `TypeAlertGone`, `TypeApplyActionStale` and their reasons.

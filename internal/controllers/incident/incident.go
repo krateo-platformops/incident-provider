@@ -88,7 +88,7 @@ func Setup(mgr ctrl.Manager, o Options) error {
 		// Alerts are read past the cache, one at a time: no informer on every Alert, and a
 		// missing Alert CRD is one failed read, not a cache that never syncs.
 		reconciler.WithExternalConnecter(&connector{kube: mgr.GetClient(), alerts: mgr.GetAPIReader(), cfg: cfg, pods: o.Pods,
-			runs: runs, alertReads: newLastRuns(), discovery: disc, targetReads: newTargetReads(), reader: mgr.GetAPIReader(), episodes: newEpisodes(),
+			runs: runs, alertReads: newLastRuns(), discovery: disc, targetReads: newTargetReads(), reader: mgr.GetAPIReader(),
 			log: log, rec: rec}),
 		reconciler.WithPollInterval(cfg.PollInterval),
 		reconciler.WithPollIntervalHook(runs.pollIntervalHook),
@@ -178,12 +178,10 @@ type connector struct {
 	// discovery and targetReads read whether the cluster serves each applyAction's target.
 	discovery   discovery.DiscoveryInterface
 	targetReads *targetReads
-	// reader reads an incident past the cache, to recheck a reanalysis request after a conflict;
-	// episodes are the ApplyActionStale episodes a reanalysis was requested for.
-	reader   client.Reader
-	episodes *episodes
-	log      logging.Logger
-	rec      event.Recorder
+	// reader reads an incident past the cache, to recheck a reanalysis request after a conflict.
+	reader client.Reader
+	log    logging.Logger
+	rec    event.Recorder
 }
 
 func (c *connector) Connect(_ context.Context, mg resource.Managed) (reconciler.ExternalClient, error) {
@@ -201,7 +199,6 @@ func (c *connector) Connect(_ context.Context, mg resource.Managed) (reconciler.
 		discovery:   c.discovery,
 		targetReads: c.targetReads,
 		reader:      c.reader,
-		episodes:    c.episodes,
 		log:         c.log.WithValues("incident", inc.Namespace+"/"+inc.Name),
 		rec:         c.rec,
 		now:         time.Now,
@@ -259,7 +256,6 @@ type external struct {
 	discovery   discovery.DiscoveryInterface
 	targetReads *targetReads
 	reader      client.Reader
-	episodes    *episodes
 	log         logging.Logger
 	rec         event.Recorder
 	now         func() time.Time
@@ -285,9 +281,6 @@ func (e *external) Observe(ctx context.Context, mg resource.Managed) (reconciler
 		e.alertReads.forget(inc.UID)
 		if e.targetReads != nil {
 			e.targetReads.forget(inc.UID)
-		}
-		if e.episodes != nil {
-			e.episodes.forget(inc.UID)
 		}
 		// A deleted Incident is Deleting. provider-runtime sets that itself while it deletes, after
 		// a successful Observe and after a failed one (v1.8.2), so this write is not required;
@@ -330,7 +323,7 @@ func (e *external) Observe(ctx context.Context, mg resource.Managed) (reconciler
 	e.plan.dirty = consumed || !equality.Semantic.DeepEqual(before, &inc.Status)
 	lastRun := e.runs.get(inc.UID)
 	e.plan.due = e.plan.live == nil && checkDue(inc, e.cfg, lastRun, now)
-	e.plan.requestReanalysis = e.reanalysisDue(inc)
+	e.plan.requestReanalysis = staleReanalysisDue(inc)
 	e.plan.from = checkFrom(inc, lastRun)
 
 	inc.SetConditions(prv1.Available())
@@ -489,15 +482,6 @@ func (e *external) readApplyTarget(inc *v1alpha1.Incident, now time.Time) *apply
 	return &t
 }
 
-// reanalysisDue reports whether the controller should request a reanalysis of inc for its
-// ApplyActionStale episode, and has not already in this process.
-func (e *external) reanalysisDue(inc *v1alpha1.Incident) bool {
-	if e.episodes == nil || !staleReanalysisDue(inc) {
-		return false
-	}
-	return !e.episodes.requested(inc.UID, inc.GetCondition(v1alpha1.TypeApplyActionStale).LastTransitionTime.Time)
-}
-
 // maxRequestAttempts bounds the conflicts requestReanalysis retries.
 const maxRequestAttempts = 3
 
@@ -505,11 +489,13 @@ const maxRequestAttempts = 3
 // runs after the status write that made ApplyActionStale True, so the episode the request answers
 // is persisted first. It patches spec.reanalysis alone, with a JSON merge patch that carries the
 // resourceVersion read: a write in between, such as a person's request, makes it conflict, and the
-// incident is read again and the guards checked again before another attempt.
+// incident is read again and the guards checked again before another attempt. The same holds for a
+// reconcile that runs on a cached incident from before the controller's own request: its patch
+// conflicts, and the fresh read finds the request pending.
 func (e *external) requestReanalysis(ctx context.Context, inc *v1alpha1.Incident) error {
 	cur := inc
 	for range maxRequestAttempts {
-		if !e.reanalysisDue(cur) {
+		if !staleReanalysisDue(cur) {
 			return nil
 		}
 		episode := cur.GetCondition(v1alpha1.TypeApplyActionStale)
@@ -528,7 +514,6 @@ func (e *external) requestReanalysis(ctx context.Context, inc *v1alpha1.Incident
 		// conflicts and is retried, never overwriting what was read.
 		err = e.kube.Patch(ctx, cur, client.RawPatch(types.MergePatchType, patch))
 		if err == nil {
-			e.episodes.request(cur.UID, episode.LastTransitionTime.Time)
 			msg := "requested a reanalysis, cause ApplyActionStale: " + episode.Message
 			e.rec.Event(cur, event.Normal(event.Reason(reasonReanalysisRequested), actionReconcile, msg))
 			e.log.Info(msg, "reason", reasonReanalysisRequested, "cause", string(v1alpha1.ReanalysisCauseApplyActionStale),
