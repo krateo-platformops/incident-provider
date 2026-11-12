@@ -12,6 +12,24 @@ timestamp: 2026-11-10T00:00:00Z
 Curated history — notable changes and decisions, newest first. Full release
 notes live in GitHub Releases. Entries record what was true when written.
 
+## 2026-11-12 — Closed and Resolved incidents are deleted after 30 days (unreleased)
+
+Incidents were never deleted. On demo, 1953 of 1957 were `Closed`, about 150 more a day, each
+carrying its analysis prompt (about 20 KB, 37.8 MB of JSON in all). The backlog OOMKilled
+alert-provider, which cached them whole (fixed there in 0.2.80), and it grows etcd, every
+consumer's cache and the portal's Incidents page without bound. Decided (Diego): keep a
+`Closed` or `Resolved` incident 30 days after it ended. Changed:
+- **`-retention` / `controller.retention`, default `720h`.** The controller deletes a `Closed` or
+  `Resolved` incident once `status.resolution.at` plus the retention has passed, within one poll
+  interval, last in its pass and pinned to its UID; its check pods and ConfigMaps go as for any
+  deletion. `0` keeps them for ever. `Open`, `Analyzing` and `Verifying` incidents are never
+  deleted, nor one with no `resolution.at` (when it ended is unknown).
+- **The controller's Role gains `delete` on `incidents`.**
+- An incident closed in a pass starts its retention then: `resolution.at` is that pass's time.
+
+Upgrading deletes, within one poll interval, every incident that ended more than 30 days ago.
+On demo, today, that is none: every `resolution.at` is from 2026-11-11 or later.
+
 ## 2026-11-12 — the check fence needs NetworkPolicy enforcement (docs)
 
 Found on krateo-057, which runs no NetworkPolicy engine: the check

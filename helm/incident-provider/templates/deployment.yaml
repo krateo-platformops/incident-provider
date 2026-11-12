@@ -44,6 +44,8 @@ spec:
               value: {{ .Values.controller.noVerdictFor | quote }}
             - name: INCIDENT_PROVIDER_ALERT_GONE_GRACE
               value: {{ .Values.controller.alertGoneGrace | quote }}
+            - name: INCIDENT_PROVIDER_RETENTION
+              value: {{ .Values.controller.retention | quote }}
             - name: INCIDENT_PROVIDER_SYNC_PERIOD
               value: {{ .Values.controller.syncPeriod | quote }}
             - name: INCIDENT_PROVIDER_MAX_RECONCILE_RATE

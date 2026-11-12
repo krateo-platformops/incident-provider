@@ -86,9 +86,13 @@ const poll = time.Second
 
 // startEnvtest starts an API server with the Incident and widget CRDs, and a manager running the
 // Incident reconciler with disc as its discovery, polling every poll. The checks namespace and
-// demo exist.
-func startEnvtest(t *testing.T) (context.Context, client.Client, *switchableDiscovery) {
+// demo exist. edits change the controller's Config.
+func startEnvtest(t *testing.T, edits ...func(*Config)) (context.Context, client.Client, *switchableDiscovery) {
 	t.Helper()
+	checks := Config{SettleWindow: time.Minute, CheckTimeout: time.Minute}
+	for _, e := range edits {
+		e(&checks)
+	}
 	env := &envtest.Environment{
 		CRDInstallOptions: envtest.CRDInstallOptions{
 			Paths: []string{filepath.Join("..", "..", "..", "helm", "incident-provider-crds", "templates", "observability.krateo.io_incidents.yaml")},
@@ -130,7 +134,7 @@ func startEnvtest(t *testing.T) (context.Context, client.Client, *switchableDisc
 			},
 			Timeout: 30 * time.Second,
 		},
-		Checks:    Config{SettleWindow: time.Minute, CheckTimeout: time.Minute},
+		Checks:    checks,
 		Pods:      CheckPods{Namespace: checksNamespace, Template: template, Timeout: time.Minute},
 		Discovery: disc,
 	}); err != nil {

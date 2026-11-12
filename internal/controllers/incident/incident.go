@@ -224,6 +224,8 @@ type plan struct {
 	stale []corev1.Pod
 	// live is the running check pod of the current script.
 	live *corev1.Pod
+	// expired means the incident is Closed or Resolved past its retention: it is deleted.
+	expired bool
 }
 
 func (p plan) String() string {
@@ -242,6 +244,9 @@ func (p plan) String() string {
 	}
 	if p.due {
 		parts = append(parts, "check due")
+	}
+	if p.expired {
+		parts = append(parts, "retention passed")
 	}
 	return strings.Join(parts, "; ")
 }
@@ -325,10 +330,12 @@ func (e *external) Observe(ctx context.Context, mg resource.Managed) (reconciler
 	e.plan.due = e.plan.live == nil && checkDue(inc, e.cfg, lastRun, now)
 	e.plan.requestReanalysis = staleReanalysisDue(inc)
 	e.plan.from = checkFrom(inc, lastRun)
+	// After this pass's own changes: an incident this pass closed has a fresh resolution.at.
+	e.plan.expired = expired(inc, e.cfg, now)
 
 	inc.SetConditions(prv1.Available())
 
-	if e.plan.dirty || len(e.plan.stale) > 0 || e.plan.due || e.plan.requestReanalysis {
+	if e.plan.dirty || len(e.plan.stale) > 0 || e.plan.due || e.plan.requestReanalysis || e.plan.expired {
 		return reconciler.ExternalObservation{ResourceExists: true, ResourceUpToDate: false, Diff: e.plan.String()}, nil
 	}
 	return reconciler.ExternalObservation{ResourceExists: true, ResourceUpToDate: true}, nil
@@ -375,6 +382,18 @@ func (e *external) Update(ctx context.Context, mg resource.Managed) error {
 	}
 	if e.plan.due {
 		return e.startCheck(ctx, inc, currentScript(inc))
+	}
+	if e.plan.expired {
+		// Last, and pinned to this incident's UID: a recreated incident of the same name is
+		// never deleted in its place. Its check pods and ConfigMaps go in Delete, as for any
+		// deletion.
+		uid := inc.UID
+		if err := e.kube.Delete(ctx, inc, client.Preconditions{UID: &uid}); resource.IgnoreNotFound(err) != nil {
+			return fmt.Errorf("cannot delete incident past its retention: %w", err)
+		}
+		e.log.Info("deleted after its retention", "state", string(inc.Status.State),
+			"resolvedBy", string(inc.Status.Resolution.By), "resolvedAt", inc.Status.Resolution.At.UTC().Format(time.RFC3339),
+			"retention", e.cfg.Retention.String())
 	}
 	return nil
 }
