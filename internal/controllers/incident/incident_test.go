@@ -115,6 +115,8 @@ func kindOf(o client.Object) string {
 		return "pod"
 	case *corev1.ConfigMap:
 		return "configmap"
+	case *v1alpha1.Incident:
+		return "incident"
 	}
 	return "object"
 }
@@ -824,5 +826,117 @@ func TestObserveReadsAlert(t *testing.T) {
 				t.Errorf("status write = %v, want %v", e.plan.dirty, tc.wantWrite)
 			}
 		})
+	}
+}
+
+func resolved(state v1alpha1.State, at time.Time) incOpt {
+	return func(inc *v1alpha1.Incident) {
+		inc.Status.State = state
+		inc.Status.HowToFix = nil
+		inc.Status.Resolution = &v1alpha1.Resolution{By: v1alpha1.ResolvedByUser, At: metav1.NewTime(at)}
+		if state == v1alpha1.StateResolved {
+			inc.Status.Resolution.By = v1alpha1.ResolvedByVerify
+		}
+	}
+}
+
+// expired holds for a Closed or Resolved incident once resolution.at plus the retention has
+// passed, and never for a live one, one with no resolution.at, or with retention off.
+func TestExpired(t *testing.T) {
+	at := t0
+	ret := Config{Retention: 30 * 24 * time.Hour}
+	cases := []struct {
+		name string
+		inc  *v1alpha1.Incident
+		cfg  Config
+		now  time.Time
+		want bool
+	}{
+		{"closed, retention passed", newIncident(v1alpha1.StateClosed, resolved(v1alpha1.StateClosed, at)), ret, at.Add(30 * 24 * time.Hour), true},
+		{"resolved, retention passed", newIncident(v1alpha1.StateResolved, resolved(v1alpha1.StateResolved, at)), ret, at.Add(31 * 24 * time.Hour), true},
+		{"closed, a second short", newIncident(v1alpha1.StateClosed, resolved(v1alpha1.StateClosed, at)), ret, at.Add(30*24*time.Hour - time.Second), false},
+		{"retention off", newIncident(v1alpha1.StateClosed, resolved(v1alpha1.StateClosed, at)), Config{}, at.Add(365 * 24 * time.Hour), false},
+		{"closed, no resolution.at", newIncident(v1alpha1.StateClosed), ret, at.Add(365 * 24 * time.Hour), false},
+		{"closed, a zero resolution.at", newIncident(v1alpha1.StateClosed, func(i *v1alpha1.Incident) {
+			i.Status.Resolution = &v1alpha1.Resolution{By: v1alpha1.ResolvedByUser}
+		}), ret, at, false},
+		{"open with an old resolution", newIncident(v1alpha1.StateOpen, func(i *v1alpha1.Incident) {
+			i.Status.Resolution = &v1alpha1.Resolution{By: v1alpha1.ResolvedByUser, At: metav1.NewTime(at)}
+		}), ret, at.Add(365 * 24 * time.Hour), false},
+		{"verifying", newIncident(v1alpha1.StateVerifying), ret, at.Add(365 * 24 * time.Hour), false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := expired(c.inc, c.cfg, c.now); got != c.want {
+				t.Errorf("expired = %v, want %v", got, c.want)
+			}
+		})
+	}
+}
+
+// A Closed incident past its retention is deleted by Update, last and pinned to its UID; one
+// within it is left alone, and nothing is written for it.
+func TestUpdateDeletesAnIncidentPastItsRetention(t *testing.T) {
+	inc := newIncident(v1alpha1.StateClosed, resolved(v1alpha1.StateClosed, t0))
+	k := newKube()
+	var pinned *types.UID
+	k.MockDelete = func(_ context.Context, o client.Object, opts ...client.DeleteOption) error {
+		k.calls = append(k.calls, "delete "+kindOf(o)+" "+o.GetName())
+		do := &client.DeleteOptions{}
+		for _, op := range opts {
+			op.ApplyToDelete(do)
+		}
+		if do.Preconditions != nil {
+			pinned = do.Preconditions.UID
+		}
+		return nil
+	}
+	e := newExternal(k, t0.Add(31*24*time.Hour))
+	e.cfg.Retention = 30 * 24 * time.Hour
+	obs, err := e.Observe(context.Background(), inc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if obs.ResourceUpToDate {
+		t.Fatal("an incident past its retention must reach Update")
+	}
+	if err := e.Update(context.Background(), inc); err != nil {
+		t.Fatal(err)
+	}
+	if d := cmp.Diff([]string{"delete incident " + inc.Name}, k.calls); d != "" {
+		t.Errorf("calls (-want +got):\n%s", d)
+	}
+	if pinned == nil || *pinned != inc.UID {
+		t.Errorf("the delete is not pinned to the incident's UID: %v", pinned)
+	}
+
+	within := newIncident(v1alpha1.StateClosed, resolved(v1alpha1.StateClosed, t0))
+	k2 := newKube()
+	e2 := newExternal(k2, t0.Add(29*24*time.Hour))
+	e2.cfg.Retention = 30 * 24 * time.Hour
+	obs, err = e2.Observe(context.Background(), within)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !obs.ResourceUpToDate {
+		t.Errorf("within its retention, nothing to do: %+v", obs)
+	}
+}
+
+// Closing an incident in this pass starts its retention now: it is not deleted in the same pass
+// even if the retention is shorter than the time since it was created.
+func TestClosingStartsTheRetention(t *testing.T) {
+	inc := newIncident(v1alpha1.StateOpen, withSpec(false, false), func(i *v1alpha1.Incident) { i.Spec.Closed = true })
+	k := newKube()
+	e := newExternal(k, t0.Add(365*24*time.Hour))
+	e.cfg.Retention = time.Hour
+	if _, err := e.Observe(context.Background(), inc); err != nil {
+		t.Fatal(err)
+	}
+	if e.plan.expired {
+		t.Fatal("an incident closed in this pass was marked expired")
+	}
+	if inc.Status.State != v1alpha1.StateClosed {
+		t.Fatalf("state %s, want Closed", inc.Status.State)
 	}
 }

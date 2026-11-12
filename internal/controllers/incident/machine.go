@@ -41,6 +41,22 @@ type Config struct {
 	// Verifying incident is closed with resolution.by alert-gone. Zero closes it at the first
 	// NotFound.
 	AlertGoneGrace time.Duration
+
+	// Retention is how long a Closed or Resolved incident is kept after status.resolution.at
+	// before the controller deletes it. Zero keeps them for ever. An incident with no
+	// resolution.at is never deleted: when it ended is unknown.
+	Retention time.Duration
+}
+
+// expired reports that inc is Closed or Resolved and its retention has passed.
+func expired(inc *v1alpha1.Incident, cfg Config, now time.Time) bool {
+	if cfg.Retention <= 0 || inc.Status.Resolution == nil || inc.Status.Resolution.At.IsZero() {
+		return false
+	}
+	if s := inc.Status.State; s != v1alpha1.StateClosed && s != v1alpha1.StateResolved {
+		return false
+	}
+	return !now.Before(inc.Status.Resolution.At.Add(cfg.Retention))
 }
 
 // pendingGrace is how long past CheckTimeout a check pod that has not finished counts as timed

@@ -50,6 +50,7 @@ func main() {
 	checksNamespace := flag.String("checks-namespace", env.String(envKey("CHECKS_NAMESPACE"), ""), "Namespace the check pods run in.")
 	applyTimeout := flag.Duration("apply-timeout", env.Duration(envKey("APPLY_TIMEOUT"), 2*time.Minute), "Deadline of one IncidentApply run: the apply pod's activeDeadlineSeconds.")
 	applyTTL := flag.Duration("apply-ttl", env.Duration(envKey("APPLY_TTL"), 30*24*time.Hour), "How long a finished IncidentApply is kept before it is deleted.")
+	retention := flag.Duration("retention", env.Duration(envKey("RETENTION"), 30*24*time.Hour), "How long a Closed or Resolved Incident is kept after it ended (status.resolution.at) before it is deleted. 0 keeps them for ever.")
 	credentialsNamespace := flag.String("credentials-namespace", env.String(envKey("CREDENTIALS_NAMESPACE"), ""), "Namespace of the <username>-clientconfig Secrets authn writes at login.")
 	checkPodTemplate := flag.String("check-pod-template", env.String(envKey("CHECK_POD_TEMPLATE"), "/etc/incident-provider/check-pod.yaml"), "File holding the check pod spec template.")
 	maxReconcileRate := flag.Int("max-reconcile-rate", env.Int(envKey("MAX_RECONCILE_RATE"), 5), "The number of concurrent reconciles.")
@@ -94,6 +95,7 @@ func main() {
 				NoVerdictRuns:  int32(min(max(*noVerdictRuns, 0), math.MaxInt32)),
 				NoVerdictFor:   *noVerdictFor,
 				AlertGoneGrace: *alertGoneGrace,
+				Retention:      *retention,
 			},
 		},
 		apply: incident.ApplyOptions{
@@ -148,6 +150,7 @@ func run(log logging.Logger, o runOptions) error {
 		"checks-namespace", o.checksNamespace,
 		"apply-timeout", o.apply.Applies.Timeout.String(),
 		"apply-ttl", o.apply.Applies.TTL.String(),
+		"retention", o.incident.Checks.Retention.String(),
 		"credentials-namespace", o.apply.Applies.CredentialsNamespace,
 		"check-reader-role", o.checkReader.Role,
 		"leader-election", o.leaderElection)

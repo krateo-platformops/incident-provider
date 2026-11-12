@@ -25,6 +25,10 @@ controller:
   # How long the Alert in an Open or Verifying incident's spec.alertRef must stay NotFound before
   # the incident is closed with resolution.by alert-gone (condition AlertGone).
   alertGoneGrace: 10m
+  # How long a Closed or Resolved Incident is kept after it ended (status.resolution.at) before
+  # the controller deletes it. "0s" keeps them for ever. Open, Analyzing and Verifying incidents
+  # are never deleted.
+  retention: 720h
   syncPeriod: 1h
   maxReconcileRate: 5
   leaderElection: true
