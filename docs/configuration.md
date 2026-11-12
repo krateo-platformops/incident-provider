@@ -119,6 +119,13 @@ pod, and `KUBECONFIG=/kube/config`; its deadline is `-apply-timeout`.
   read-only RBAC and `dnsPolicy: None` still apply, but scripts are no longer
   kept from the network. Enable enforcement on any cluster that runs checks.
   Nothing in the chart can detect its absence, so verify it per cluster.
+  "The policy is present" proves nothing: on an unenforced cluster it lists and
+  describes exactly as if it worked, with no status, event or warning. The
+  acceptance test is a **negative reachability test** on an enforcing cluster:
+  from a check pod, a connection to an address other than the apiserver must
+  fail, with a control connection to the apiserver succeeding. GKE clusters are
+  unenforced by default, so a throwaway cluster used for that test needs
+  `--enable-network-policy` (or Dataplane V2) at create time.
 
 ## What the controller can do
 
