@@ -12,6 +12,14 @@ timestamp: 2026-11-10T00:00:00Z
 Curated history — notable changes and decisions, newest first. Full release
 notes live in GitHub Releases. Entries record what was true when written.
 
+## 2026-11-12 — the check fence needs NetworkPolicy enforcement (docs)
+
+Found on krateo-057, which runs no NetworkPolicy engine: the check
+NetworkPolicy exists there but does nothing, so check pods are not kept from
+the network, while demo (Calico) enforces it. The docs now say the fence needs
+enforcement and that nothing in the chart detects its absence. Read-only RBAC
+and `dnsPolicy: None` are unaffected. No code change.
+
 ## 2026-11-10 — `resolution.by: analysis-failed` (unreleased)
 
 alert-provider now closes an incident whose analysis finally failed:
