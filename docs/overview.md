@@ -274,7 +274,8 @@ default), holding only the check pods and their read-only service account:
   and subresources, its rules kept current from discovery by the controller;
   no writes;
 - no DNS, and a NetworkPolicy allowing egress to the apiserver only, and no
-  ingress;
+  ingress (effective only where the cluster enforces NetworkPolicy; see
+  [configuration](./configuration.md));
 - `activeDeadlineSeconds: 60`, and the `restricted` Pod Security Standard.
 
 Apply pods differ in one way: they mount no service account token, and

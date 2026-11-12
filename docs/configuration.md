@@ -112,6 +112,13 @@ pod, and `KUBECONFIG=/kube/config`; its deadline is `-apply-timeout`.
   Cilium does not match node addresses with an ipBlock by default; where the
   apiserver runs on the nodes, allow it with a CiliumNetworkPolicy
   (`toEntities: [kube-apiserver]`).
+  **The fence needs a cluster that enforces NetworkPolicy.** On a cluster
+  without a policy engine (on GKE: no Dataplane V2 and no Calico network policy;
+  only kube-proxy and netd running) the NetworkPolicy object exists but does
+  nothing, and check pods can reach whatever the node network allows. The
+  read-only RBAC and `dnsPolicy: None` still apply, but scripts are no longer
+  kept from the network. Enable enforcement on any cluster that runs checks.
+  Nothing in the chart can detect its absence, so verify it per cluster.
 
 ## What the controller can do
 
