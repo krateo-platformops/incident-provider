@@ -8,7 +8,8 @@ metadata:
   labels:
     {{- include "incident-provider.labels" . | nindent 4 }}
 rules:
-  # Finalizer, create-handshake annotations, and consuming spec.applied.
+  # Finalizer, create-handshake annotations, consuming spec.applied, and setting spec.reanalysis
+  # when ApplyActionStale becomes True.
   - apiGroups: ["observability.krateo.io"]
     resources: ["incidents"]
     verbs: ["get", "list", "watch", "update", "patch"]

@@ -21,6 +21,14 @@ const (
 // alert's namespace.
 const LabelAlert = "observability.krateo.io/alert"
 
+// LabelAnalysis, with the value AnalysisHuman, marks an incident that a person analyzes, not the
+// writer's agent. The writer (alert-provider) copies it from the Alert, and drops a reanalysis
+// request on such an incident unanswered, so the controller never files one there.
+const (
+	LabelAnalysis = "observability.krateo.io/analysis"
+	AnalysisHuman = "human"
+)
+
 // State is the lifecycle state of an Incident.
 // +kubebuilder:validation:Enum=Analyzing;Open;Verifying;Resolved;Closed
 type State string
@@ -183,6 +191,26 @@ const (
 	ReasonAlertFound    prv1.ConditionReason = "AlertFound"
 )
 
+// TypeApplyActionStale is a condition on status.howToFix.applyAction, read from API discovery
+// while the incident is Open or Verifying: whether this cluster serves the apiVersion and
+// resource it targets. True: it does not, so the portal's Apply would fail; the message is
+// "applyAction targets <apiVersion> <resource>, which this cluster does not serve; served:
+// <versions>", with the versions that serve the resource sorted and comma-separated, or "none".
+// The controller never rewrites applyAction: its payload is written against the schema of the
+// version it names, so only a reanalysis replaces it. False: the target is served. Absent while
+// there is no applyAction. A failed discovery read changes nothing.
+const TypeApplyActionStale prv1.ConditionType = "ApplyActionStale"
+
+// Reasons of the ApplyActionStale condition.
+const (
+	// ReasonVersionNotServed: True, the resource is served, at other versions only.
+	ReasonVersionNotServed prv1.ConditionReason = "VersionNotServed"
+	// ReasonResourceNotFound: True, the resource is served at no version.
+	ReasonResourceNotFound prv1.ConditionReason = "ResourceNotFound"
+	// ReasonServed: False, the target is served.
+	ReasonServed prv1.ConditionReason = "Served"
+)
+
 // AlertRef locates the Alert that opened an Incident.
 type AlertRef struct {
 	// Name of the Alert. It is also the value of the observability.krateo.io/alert label, so it is
@@ -232,13 +260,36 @@ type IncidentSpec struct {
 	// Reanalysis asks for a new root-cause analysis of an Open or Verifying incident. The writer
 	// (alert-provider) consumes it: it records it in status.reanalysis, moves the incident back to
 	// Analyzing, removes this field and runs the analysis again. In any other state it is removed
-	// unanswered.
+	// unanswered. A person sets it (the portal's re-run), or the controller does, with cause
+	// ApplyActionStale, when the cluster stops serving the target of status.howToFix.applyAction.
 	// +optional
 	Reanalysis *ReanalysisRequest `json:"reanalysis,omitempty"`
 }
 
+// ReanalysisCause is who, or what, asked for a reanalysis.
+// +kubebuilder:validation:Enum=Person;ApplyActionStale
+type ReanalysisCause string
+
+const (
+	// ReanalysisCausePerson: a person asked, from the portal or by writing spec.reanalysis. The
+	// default: a request without a cause is a person's.
+	ReanalysisCausePerson ReanalysisCause = "Person"
+	// ReanalysisCauseApplyActionStale: the controller asked, because ApplyActionStale became True:
+	// the cluster does not serve the target of status.howToFix.applyAction. It asks once per
+	// episode of the condition.
+	ReanalysisCauseApplyActionStale ReanalysisCause = "ApplyActionStale"
+)
+
+// ReanalysisFeedbackApplyActionStale is the feedback of the controller's request.
+const ReanalysisFeedbackApplyActionStale = "applyAction targets a version this cluster no longer serves"
+
 // ReanalysisRequest is a request for a new root-cause analysis.
 type ReanalysisRequest struct {
+	// Cause is who asked: Person (the default) or ApplyActionStale (the controller).
+	// +kubebuilder:default=Person
+	// +optional
+	Cause ReanalysisCause `json:"cause,omitempty"`
+
 	// Feedback is what the person asking found wrong with the analysis, for the agent to address.
 	// +kubebuilder:validation:MaxLength=2000
 	// +optional
@@ -250,6 +301,11 @@ type ReanalysisRequest struct {
 type Reanalysis struct {
 	// At is when the request was consumed.
 	At metav1.Time `json:"at"`
+
+	// Cause is the request's cause; the writer copies it from spec.reanalysis.cause.
+	// +kubebuilder:default=Person
+	// +optional
+	Cause ReanalysisCause `json:"cause,omitempty"`
 
 	// Feedback is the request's feedback.
 	// +kubebuilder:validation:MaxLength=2000

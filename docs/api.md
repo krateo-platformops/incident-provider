@@ -25,6 +25,7 @@ A sample with every field is [`examples/incident`](../examples/incident/README.m
 | Name | `‹alert name›-‹yyyymmdd-hhmmss›` of the opening firing, one object per incident |
 | Namespace | the Alert's namespace, `spec.alertRef.namespace` |
 | Label | `observability.krateo.io/alert: ‹spec.alertRef.name›`, set by the writer at creation |
+| Label | `observability.krateo.io/analysis: human`, copied by the writer from the Alert: a person analyzes the incident. The writer drops reanalysis requests on it, so the controller files none |
 
 List one alert's incidents with the label, in the alert's namespace:
 
@@ -46,7 +47,7 @@ kubectl get incidents -n krateo-system -l observability.krateo.io/alert=composit
 | `triggeredAt` | date-time | writer | when the opening firing arrived |
 | `applied` | bool | human: "I applied it", or the portal's Apply; reset by the controller | the apply script ran. The controller consumes it: it moves Open to Verifying, records an `apply` result and sets `applied` back to `false` |
 | `closed` | bool | human: the portal's Close; the writer, closing a failed analysis | moves any state to Closed. The writer sets it with the annotation `observability.krateo.io/closed-reason: analysis-failed` in one patch (see `resolution.by`) |
-| `reanalysis` | `{feedback}` | human: the portal's Re-run analysis; removed by the writer | asks for a new analysis of an `Open` or `Verifying` incident. The writer consumes it: it records it in `status.reanalysis`, moves the incident back to `Analyzing`, removes the field and runs the analysis again with the previous one, the checks' results and `feedback` (at most 2000 characters). In any other state it is removed unanswered |
+| `reanalysis` | `{cause, feedback}` | human: the portal's Re-run analysis, `cause: Person`; the controller, `cause: ApplyActionStale` (see [ApplyActionStale](#the-applyactionstale-condition)); removed by the writer | asks for a new analysis of an `Open` or `Verifying` incident. `cause` is `Person` (the default: the apiserver sets it on a request without one) or `ApplyActionStale`. The writer consumes it: it records it in `status.reanalysis`, moves the incident back to `Analyzing`, removes the field and runs the analysis again with the previous one, the checks' results and `feedback` (at most 2000 characters). In any other state it is removed unanswered |
 
 ## status
 
@@ -67,7 +68,7 @@ Lifecycle and checks:
 | `verifyingSince` | date-time | controller | the start of the settle window: when the incident entered `Verifying`, or was applied again while `Verifying`. Set only while `Verifying` |
 | `resolution.by` | `verify` \| `user` \| `alert-gone` \| `analysis-failed`, required | controller | `verify` with `Resolved`; `user`, `alert-gone` or `analysis-failed` with `Closed`. `alert-gone`: the Alert in `spec.alertRef` was deleted. `analysis-failed`: the writer closed the incident because its analysis failed: `spec.closed` carries the annotation `observability.krateo.io/closed-reason: analysis-failed`, and the field managers that own `spec.closed` all own that annotation too (see [overview](./overview.md#closed-by-the-writer)). Any other `spec.closed` is `user` |
 | `resolution.at` | date-time, required | controller | when the incident ended |
-| `conditions[]` | provider-runtime `Condition` | controller | `Ready` and `Synced` from provider-runtime, plus `Reproduced`, `ChecksUnknown` and `AlertGone` below |
+| `conditions[]` | provider-runtime `Condition` | controller | `Ready` and `Synced` from provider-runtime, plus `Reproduced`, `ChecksUnknown`, `AlertGone` and `ApplyActionStale` below |
 
 Any other exit code, and a timeout, is unknown: it is recorded and changes no
 state; too many in a row stop the script (`ChecksUnknown`).
@@ -89,7 +90,7 @@ The root-cause analysis, written by the writer:
 | `assumptions[]` | string | what it assumed for lack of it |
 | `error` | string | why the analysis failed |
 | `completedAt` | date-time | when the analysis finished |
-| `reanalysis` | `{at, feedback, count}` | the latest `spec.reanalysis` the writer consumed: when, its feedback, and how many reanalyses the incident has had |
+| `reanalysis` | `{at, cause, feedback, count}` | the latest `spec.reanalysis` the writer consumed: when, its cause (`Person`, the default, or `ApplyActionStale`), its feedback, and how many reanalyses the incident has had |
 
 A reanalysis clears every field above, `howToFix`, `lastChecks`,
 `verifyingSince` and the `Reproduced` condition before the new analysis runs:
@@ -126,6 +127,81 @@ It is absent until a script hits the bound.
 
 It is read only while `Open` or `Verifying`, and is absent while the Alert has
 always been found.
+
+## The ApplyActionStale condition
+
+Whether this cluster serves the `apiVersion` and `resource` that
+`howToFix.applyAction` targets, read from API discovery:
+
+| Status | Reason | Meaning |
+|---|---|---|
+| `True` | `VersionNotServed` | the resource is served, but not at `applyAction.apiVersion`: the portal's Apply would fail |
+| `True` | `ResourceNotFound` | the resource is served at no version of its group (or the group is not served, or `apiVersion` does not parse) |
+| `False` | `Served` | the target is served |
+
+The `True` message has a fixed format, for agents to match:
+
+```
+applyAction targets <apiVersion> <resource>, which this cluster does not serve; served: <versions>
+```
+
+`<versions>` are the versions of the group that serve the resource, sorted as
+strings and joined with `, ` (e.g. `served: v0-1-26, v0-1-28`), or `none` for
+`ResourceNotFound`. The `False` message is `applyAction targets <apiVersion>
+<resource>, which this cluster serves`.
+
+- It is read while `Open` or `Verifying`, the states in which Apply can be
+  sent: once a poll interval, and at once when `applyAction` names another
+  target. It is read from discovery each time, never from a cache, so a
+  version the cluster stops serving is seen at the next read, and a newly
+  served one too.
+- `lastTransitionTime` changes only when the status flips: a different list
+  of served versions changes the message alone.
+- A discovery read that fails for another reason than NotFound changes
+  nothing; it is retried at the next reconcile.
+- It is absent while there is no `applyAction`, and removed when an `Open`
+  or `Verifying` incident has none. In the other states it is left as it is:
+  a reanalysis (`Analyzing`) clears `howToFix`, and the condition outlives
+  it, so the new analysis continues the episode.
+- The controller never rewrites `applyAction`: its `payload` is written
+  against the schema of the version it names. A reanalysis replaces it.
+
+### The automatic reanalysis
+
+An episode of the condition is the time since it last became `True`
+(`lastTransitionTime`). In each episode the controller asks for one
+reanalysis itself: it sets
+
+```yaml
+spec:
+  reanalysis:
+    cause: ApplyActionStale
+    feedback: applyAction targets a version this cluster no longer serves
+```
+
+when `ApplyActionStale` is `True` on an incident the writer would answer a
+request on: `Open` or `Verifying`, and not labelled
+`observability.krateo.io/analysis: human` (a person analyzes it). This is
+alert-provider's own rule (`Writer.Reanalyze`); it drops a request on any
+other incident unanswered. It does not ask when
+
+- `spec.reanalysis` is already set: a pending request, a person's, wins and
+  is left as it is;
+- `status.reanalysis.at` is at or after the condition's `lastTransitionTime`:
+  a reanalysis was consumed in this episode, so it is answered.
+
+A new analysis that targets an unserved version again keeps the condition
+`True`, with the same `lastTransitionTime`: no second request. The target
+served, then unserved again, starts a new episode, which asks again. Since
+the controller asks only where the writer answers, a request can be dropped
+unanswered only in a race: the incident changes state between the request and
+its consumption. It is then in a state the controller does not ask in, so the
+request is not filed again.
+
+It writes the request with a JSON merge patch of `spec.reanalysis` alone that
+carries the `resourceVersion` it read; on a conflict it reads the incident
+again and checks the conditions above again. Each request is an Event and a
+log line with reason `ReanalysisRequested`.
 
 ## Rules the apiserver enforces
 
@@ -172,7 +248,8 @@ reason `ApplyFinished`, its message starting with the phase
 - `v1alpha1.Incident` satisfies provider-runtime's `resource.Managed`,
   `v1alpha1.IncidentList` its `resource.ManagedList`.
 - `v1alpha1.IncidentApply` satisfies `resource.Managed` too.
-- Constants: `RequesterPolicy`, `MaxApplyOutput`, `ReasonApplyFinished`, the `Apply*` phases, `LabelAlert`, the `State*`, `Script*`, `ResolvedBy*`,
-  `Trigger*` and `Source*` values, `TypeReproduced`, `TypeChecksUnknown`, `TypeAlertGone` and
-  their reasons.
+- Constants: `RequesterPolicy`, `MaxApplyOutput`, `ReasonApplyFinished`, the `Apply*` phases, `LabelAlert`, `LabelAnalysis` and `AnalysisHuman`, the `State*`, `Script*`, `ResolvedBy*`,
+  `Trigger*`, `Source*`, `Category*`, `Owner*`, `OwnerEvidence*` and `ReanalysisCause*` values,
+  `ReanalysisFeedbackApplyActionStale`, `TypeReproduced`,
+  `TypeChecksUnknown`, `TypeAlertGone`, `TypeApplyActionStale` and their reasons.
 - `apis.AddToScheme` registers the group.
