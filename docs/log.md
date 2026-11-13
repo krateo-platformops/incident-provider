@@ -30,6 +30,16 @@ consumer's cache and the portal's Incidents page without bound. Decided (Diego):
 Upgrading deletes, within one poll interval, every incident that ended more than 30 days ago.
 On demo, today, that is none: every `resolution.at` is from 2026-11-11 or later.
 
+## 2026-11-13 — the check fence accepted on demo (negative reachability)
+
+Accepted on demo (Calico enforces) with the test the configuration page prescribes. Two
+throwaway pods in `krateo-incident-checks`, with the check image, ServiceAccount and security
+settings: one labelled `app.kubernetes.io/component: incident-check` (selected by
+`incident-provider-checks`), one not (the control). From the fenced pod the apiserver answered
+(`Unauthorized`: TLS and HTTP completed), while `1.1.1.1:443` and an in-cluster Service both timed
+out. From the control pod the same two targets answered (refused, and an HTTP reply), so the
+timeouts are the policy's. Both pods were deleted afterwards. 057 stays unenforced by decision.
+
 ## 2026-11-12 — the check fence needs NetworkPolicy enforcement (docs)
 
 Found on krateo-057, which runs no NetworkPolicy engine: the check
