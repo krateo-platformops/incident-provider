@@ -291,7 +291,7 @@ func TestRequestReanalysis(t *testing.T) {
 		wantErr     bool
 	}{
 		{name: "no conflict: one patch", wantPatches: []string{
-			`{"metadata":{"annotations":{"observability.krateo.io/stale-reanalysis":"2026-09-25T14:00:00Z/0"},"resourceVersion":"7"},"spec":{"reanalysis":{"cause":"ApplyActionStale","feedback":"applyAction targets a version this cluster no longer serves"}}}`}},
+			`{"metadata":{"annotations":{"observability.krateo.io/stale-reanalyses":"1","observability.krateo.io/stale-reanalysis":"2026-09-25T14:00:00Z/0"},"resourceVersion":"7"},"spec":{"reanalysis":{"cause":"ApplyActionStale","feedback":"applyAction targets a version this cluster no longer serves"}}}`}},
 		{name: "a conflict, still due: the patch again, with the new resourceVersion", conflicts: 1,
 			fresh: func() *v1alpha1.Incident {
 				i := newIncident(v1alpha1.StateOpen, withApplyAction("x/v1", "widgets"), stale)
@@ -299,8 +299,8 @@ func TestRequestReanalysis(t *testing.T) {
 				return i
 			},
 			wantPatches: []string{
-				`{"metadata":{"annotations":{"observability.krateo.io/stale-reanalysis":"2026-09-25T14:00:00Z/0"},"resourceVersion":"7"},"spec":{"reanalysis":{"cause":"ApplyActionStale","feedback":"applyAction targets a version this cluster no longer serves"}}}`,
-				`{"metadata":{"annotations":{"observability.krateo.io/stale-reanalysis":"2026-09-25T14:00:00Z/0"},"resourceVersion":"8"},"spec":{"reanalysis":{"cause":"ApplyActionStale","feedback":"applyAction targets a version this cluster no longer serves"}}}`}},
+				`{"metadata":{"annotations":{"observability.krateo.io/stale-reanalyses":"1","observability.krateo.io/stale-reanalysis":"2026-09-25T14:00:00Z/0"},"resourceVersion":"7"},"spec":{"reanalysis":{"cause":"ApplyActionStale","feedback":"applyAction targets a version this cluster no longer serves"}}}`,
+				`{"metadata":{"annotations":{"observability.krateo.io/stale-reanalyses":"1","observability.krateo.io/stale-reanalysis":"2026-09-25T14:00:00Z/0"},"resourceVersion":"8"},"spec":{"reanalysis":{"cause":"ApplyActionStale","feedback":"applyAction targets a version this cluster no longer serves"}}}`}},
 		{name: "a conflict with a person's request: it wins, no second patch", conflicts: 1,
 			fresh: func() *v1alpha1.Incident {
 				i := newIncident(v1alpha1.StateOpen, withApplyAction("x/v1", "widgets"), stale)
@@ -309,7 +309,7 @@ func TestRequestReanalysis(t *testing.T) {
 				return i
 			},
 			wantPatches: []string{
-				`{"metadata":{"annotations":{"observability.krateo.io/stale-reanalysis":"2026-09-25T14:00:00Z/0"},"resourceVersion":"7"},"spec":{"reanalysis":{"cause":"ApplyActionStale","feedback":"applyAction targets a version this cluster no longer serves"}}}`}},
+				`{"metadata":{"annotations":{"observability.krateo.io/stale-reanalyses":"1","observability.krateo.io/stale-reanalysis":"2026-09-25T14:00:00Z/0"},"resourceVersion":"7"},"spec":{"reanalysis":{"cause":"ApplyActionStale","feedback":"applyAction targets a version this cluster no longer serves"}}}`}},
 		{name: "conflicts every time: an error", conflicts: maxRequestAttempts, wantErr: true,
 			fresh: func() *v1alpha1.Incident {
 				return newIncident(v1alpha1.StateOpen, withApplyAction("x/v1", "widgets"), stale)

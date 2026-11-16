@@ -28,6 +28,11 @@ rules:
   - apiGroups: ["observability.krateo.io"]
     resources: ["alerts"]
     verbs: ["get"]
+  # The schema of a stale applyAction's target, to decide whether it can be re-targeted to the
+  # CRD's storage version without a reanalysis (condition ApplyActionStale, reason Retargeted).
+  - apiGroups: ["apiextensions.k8s.io"]
+    resources: ["customresourcedefinitions"]
+    verbs: ["get"]
   # Whether the requester may patch the incident: running its apply script takes that right.
   - apiGroups: ["authorization.k8s.io"]
     resources: ["subjectaccessreviews"]

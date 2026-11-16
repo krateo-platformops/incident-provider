@@ -96,7 +96,7 @@ func startEnvtest(t *testing.T, edits ...func(*Config)) (context.Context, client
 	env := &envtest.Environment{
 		CRDInstallOptions: envtest.CRDInstallOptions{
 			Paths: []string{filepath.Join("..", "..", "..", "helm", "incident-provider-crds", "templates", "observability.krateo.io_incidents.yaml")},
-			CRDs:  []*apiextensionsv1.CustomResourceDefinition{widgetCRD()},
+			CRDs:  []*apiextensionsv1.CustomResourceDefinition{widgetCRD(), envGizmoCRD()},
 		},
 		ErrorIfCRDPathMissing: true,
 	}
@@ -186,6 +186,9 @@ func TestApplyActionStaleEnvtest(t *testing.T) {
 	})
 
 	const target = "applyAction targets " + widgetsGroup + "/v1 widgets, which this cluster "
+	// widgets keep every field by x-kubernetes-preserve-unknown-fields, so no field is declared and
+	// the controller cannot prove a re-target to the storage version safe.
+	const notRetargeted = "; not re-targeted: spec is not declared in " + widgetsGroup + "/v2"
 
 	served := waitFor(ctx, t, kube, inc, "False, Served", func(c prv1.Condition) bool {
 		return c.Status == metav1.ConditionFalse && c.Reason == v1alpha1.ReasonServed && c.Message == target+"serves"
@@ -196,7 +199,7 @@ func TestApplyActionStaleEnvtest(t *testing.T) {
 	setServed(ctx, t, kube, map[string]bool{"v1": false})
 	stale := waitFor(ctx, t, kube, inc, "True, VersionNotServed, served: v2", func(c prv1.Condition) bool {
 		return c.Status == metav1.ConditionTrue && c.Reason == v1alpha1.ReasonVersionNotServed &&
-			c.Message == target+"does not serve; served: v2"
+			c.Message == target+"does not serve; served: v2"+notRetargeted
 	})
 	if !stale.LastTransitionTime.After(served.LastTransitionTime.Time) {
 		t.Errorf("served -> stale: lastTransitionTime %s, want after %s", stale.LastTransitionTime, served.LastTransitionTime)
@@ -206,7 +209,7 @@ func TestApplyActionStaleEnvtest(t *testing.T) {
 		time.Sleep(1100 * time.Millisecond)
 		addVersion(ctx, t, kube, "v3")
 		c := waitFor(ctx, t, kube, inc, "True, served: v2, v3", func(c prv1.Condition) bool {
-			return c.Status == metav1.ConditionTrue && c.Message == target+"does not serve; served: v2, v3"
+			return c.Status == metav1.ConditionTrue && c.Message == target+"does not serve; served: v2, v3"+notRetargeted
 		})
 		if !c.LastTransitionTime.Equal(&stale.LastTransitionTime) {
 			t.Errorf("lastTransitionTime = %s, want %s: the status did not flip", c.LastTransitionTime, stale.LastTransitionTime)
@@ -249,7 +252,7 @@ func TestApplyActionStaleEnvtest(t *testing.T) {
 		})
 	})
 
-	t.Run("the controller never changes applyAction", func(t *testing.T) {
+	t.Run("an applyAction it cannot prove re-targetable is never changed", func(t *testing.T) {
 		var got v1alpha1.Incident
 		if err := kube.Get(ctx, client.ObjectKeyFromObject(inc), &got); err != nil {
 			t.Fatal(err)

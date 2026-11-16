@@ -24,6 +24,19 @@ const (
 // writer stamped is compared with one the controller stamped. Nothing else writes it.
 const AnnotationStaleReanalysis = "observability.krateo.io/stale-reanalysis"
 
+// AnnotationStaleReanalyses is how many reanalyses the controller has requested for the incident
+// because an applyAction went stale, across all ApplyActionStale episodes: a decimal count. The
+// controller writes it in the same patch as each request, and stops requesting at
+// StaleReanalysisBudget (condition ReanalysisBudgetExhausted). A person's requests are not counted.
+// An incident without it that carries AnnotationStaleReanalysis counts 1: it was asked for once
+// before the count existed. A value that does not parse counts as the budget spent. Nothing else
+// writes it.
+const AnnotationStaleReanalyses = "observability.krateo.io/stale-reanalyses"
+
+// StaleReanalysisBudget is how many reanalyses the controller requests for one incident because an
+// applyAction went stale, across all episodes. A person can always request more.
+const StaleReanalysisBudget = 3
+
 // LabelAlert carries the name of the Alert that opened an Incident. Writers set it at creation,
 // with the value of spec.alertRef.name, so one alert's incidents list with a label selector in the
 // alert's namespace.
@@ -204,9 +217,16 @@ const (
 // resource it targets. True: it does not, so the portal's Apply would fail; the message is
 // "applyAction targets <apiVersion> <resource>, which this cluster does not serve; served:
 // <versions>", with the versions that serve the resource sorted and comma-separated, or "none".
-// The controller never rewrites applyAction: its payload is written against the schema of the
-// version it names, so only a reanalysis replaces it. False: the target is served. Absent while
-// there is no applyAction. A failed discovery read changes nothing.
+// The controller re-targets applyAction itself, with no reanalysis, only when the change is
+// provably version-only: the resource is a CRD whose storage version is served; every field the
+// payload sets is declared, with a matching type, in that version's schema (a field kept only by
+// x-kubernetes-preserve-unknown-fields is not declared); and no script of howToFix names the old
+// version. It then rewrites applyAction.apiVersion (and, for create, the payload's apiVersion) to
+// the storage version, and the condition is False with reason Retargeted. Nothing was approved in
+// advance: a person reviews and applies the re-targeted action as any other. Otherwise the
+// condition is True and the controller requests a reanalysis, within StaleReanalysisBudget. False:
+// the target is served. Absent while there is no applyAction. A failed discovery or CRD read
+// changes nothing.
 const TypeApplyActionStale prv1.ConditionType = "ApplyActionStale"
 
 // Reasons of the ApplyActionStale condition.
@@ -217,7 +237,21 @@ const (
 	ReasonResourceNotFound prv1.ConditionReason = "ResourceNotFound"
 	// ReasonServed: False, the target is served.
 	ReasonServed prv1.ConditionReason = "Served"
+	// ReasonRetargeted: False, the controller re-targeted applyAction from a version no longer
+	// served to the CRD's storage version. The message is "applyAction re-targeted from <old> to
+	// <new> <resource>: <old> is not served, and every field it sets is declared in <new>; review
+	// and apply it again". It stays while the re-targeted version is served.
+	ReasonRetargeted prv1.ConditionReason = "Retargeted"
 )
+
+// TypeReanalysisBudgetExhausted is a condition on the controller's reanalysis requests for stale
+// applyActions. True: ApplyActionStale is True, this episode has no request, and the controller has
+// already requested StaleReanalysisBudget for the incident, so it requests none: a person must
+// re-run the analysis. Absent otherwise. Read while the incident is Open or Verifying.
+const TypeReanalysisBudgetExhausted prv1.ConditionType = "ReanalysisBudgetExhausted"
+
+// ReasonBudgetSpent is the reason of a True ReanalysisBudgetExhausted.
+const ReasonBudgetSpent prv1.ConditionReason = "BudgetSpent"
 
 // AlertRef locates the Alert that opened an Incident.
 type AlertRef struct {
@@ -269,7 +303,8 @@ type IncidentSpec struct {
 	// (alert-provider) consumes it: it records it in status.reanalysis, moves the incident back to
 	// Analyzing, removes this field and runs the analysis again. In any other state it is removed
 	// unanswered. A person sets it (the portal's re-run), or the controller does, with cause
-	// ApplyActionStale, when the cluster stops serving the target of status.howToFix.applyAction.
+	// ApplyActionStale, when the cluster stops serving the target of status.howToFix.applyAction
+	// and a re-target is not provably safe, at most StaleReanalysisBudget times per incident.
 	// +optional
 	Reanalysis *ReanalysisRequest `json:"reanalysis,omitempty"`
 }
@@ -283,8 +318,9 @@ const (
 	// default: a request without a cause is a person's.
 	ReanalysisCausePerson ReanalysisCause = "Person"
 	// ReanalysisCauseApplyActionStale: the controller asked, because ApplyActionStale became True:
-	// the cluster does not serve the target of status.howToFix.applyAction. It asks once per
-	// episode of the condition.
+	// the cluster does not serve the target of status.howToFix.applyAction, and the controller
+	// could not prove a re-target safe. It asks once per episode of the condition, and at most
+	// StaleReanalysisBudget times per incident.
 	ReanalysisCauseApplyActionStale ReanalysisCause = "ApplyActionStale"
 )
 

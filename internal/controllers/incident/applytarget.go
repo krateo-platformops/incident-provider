@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"slices"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -27,6 +28,9 @@ type applyTarget struct {
 	// versions are the versions of the target's group that serve the resource, sorted. Read only
 	// when served is false; empty when no version serves it.
 	versions []string
+	// retarget is whether the applyAction can move to another version without a reanalysis. Set
+	// only when served is false and versions is not empty.
+	retarget *retarget
 }
 
 // applyActionOf is the incident's applyAction, nil without one.
@@ -141,6 +145,24 @@ func observeApplyAction(inc *v1alpha1.Incident, t *applyTarget, now time.Time) [
 		return nil
 	}
 	target := a.APIVersion + " " + a.Resource
+	old := inc.GetCondition(v1alpha1.TypeApplyActionStale)
+	kv := []any{"state", string(inc.Status.State), "apiVersion", a.APIVersion, "resource", a.Resource}
+	if t.served && old.Status == metav1.ConditionFalse && old.Reason == v1alpha1.ReasonRetargeted &&
+		strings.Contains(old.Message, " to "+target+":") {
+		// The controller's own re-target, still served: its record stays.
+		return nil
+	}
+	notRetargeted := ""
+	if !t.served && t.retarget != nil {
+		why := t.retarget.why
+		if why == "" {
+			why = scriptsNaming(inc.Status.HowToFix, a.APIVersion, a.Resource)
+		}
+		if why == "" {
+			return retargetTo(inc, a, t.retarget.to, old, now, kv)
+		}
+		notRetargeted = "; not re-targeted: " + why
+	}
 	c := prv1.Condition{
 		Type:    v1alpha1.TypeApplyActionStale,
 		Status:  metav1.ConditionFalse,
@@ -154,9 +176,8 @@ func observeApplyAction(inc *v1alpha1.Incident, t *applyTarget, now time.Time) [
 			served = strings.Join(t.versions, ", ")
 			c.Reason = v1alpha1.ReasonVersionNotServed
 		}
-		c.Message = "applyAction targets " + target + ", which this cluster does not serve; served: " + served
+		c.Message = "applyAction targets " + target + ", which this cluster does not serve; served: " + served + notRetargeted
 	}
-	old := inc.GetCondition(v1alpha1.TypeApplyActionStale)
 	c.LastTransitionTime = metav1.NewTime(now).Rfc3339Copy()
 	if old.Status == c.Status {
 		c.LastTransitionTime = old.LastTransitionTime
@@ -169,7 +190,6 @@ func observeApplyAction(inc *v1alpha1.Incident, t *applyTarget, now time.Time) [
 	}
 	inc.SetConditions(c)
 
-	kv := []any{"state", string(inc.Status.State), "apiVersion", a.APIVersion, "resource", a.Resource}
 	switch {
 	case c.Status == metav1.ConditionTrue && old.Status != metav1.ConditionTrue:
 		return []change{{reason: "ApplyActionStale", message: c.Message, kv: kv}}
@@ -180,6 +200,33 @@ func observeApplyAction(inc *v1alpha1.Incident, t *applyTarget, now time.Time) [
 	}
 	return nil
 }
+
+// retargetTo moves a, the incident's applyAction, to apiVersion to, and records it in a False
+// ApplyActionStale with reason Retargeted. The status write that persists it carries the
+// resourceVersion read, so it never overwrites an analysis the writer wrote in between.
+func retargetTo(inc *v1alpha1.Incident, a *v1alpha1.ApplyAction, to string, old prv1.Condition, now time.Time, kv []any) []change {
+	from := a.APIVersion
+	if err := retargetAction(a, to); err != nil {
+		// planRetarget parsed the same payload: unreachable, and then nothing changes.
+		return nil
+	}
+	c := prv1.Condition{
+		Type:   v1alpha1.TypeApplyActionStale,
+		Status: metav1.ConditionFalse,
+		Reason: v1alpha1.ReasonRetargeted,
+		Message: "applyAction re-targeted from " + from + " to " + to + " " + a.Resource + ": " + from +
+			" is not served, and every field it sets is declared in " + to + "; review and apply it again",
+		LastTransitionTime: metav1.NewTime(now).Rfc3339Copy(),
+	}
+	if old.Status == c.Status {
+		c.LastTransitionTime = old.LastTransitionTime
+	}
+	inc.SetConditions(c)
+	return []change{{reason: reasonApplyActionRetargeted, message: c.Message, kv: append(kv, "to", to)}}
+}
+
+// reasonApplyActionRetargeted is the Event and log reason of the controller's re-target.
+const reasonApplyActionRetargeted = "ApplyActionRetargeted"
 
 // reasonStaleAfterReanalysis is the Event and log reason of an episode whose own reanalysis was
 // answered and still targets an unserved version.
@@ -318,7 +365,66 @@ func staleReanalysisDue(inc *v1alpha1.Incident) bool {
 	if c.Status != metav1.ConditionTrue || inc.Spec.Reanalysis != nil {
 		return false
 	}
-	return !requested(inc, c)
+	return !requested(inc, c) && !budgetSpent(inc)
+}
+
+// staleRequests is how many reanalyses the controller has requested for the incident because an
+// applyAction went stale (v1alpha1.AnnotationStaleReanalyses). Without the count, an incident with
+// the controller's episode record was asked for once. ok is false when the count does not parse.
+func staleRequests(inc *v1alpha1.Incident) (n int, ok bool) {
+	v, has := inc.Annotations[v1alpha1.AnnotationStaleReanalyses]
+	if !has {
+		if _, asked := inc.Annotations[v1alpha1.AnnotationStaleReanalysis]; asked {
+			return 1, true
+		}
+		return 0, true
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n < 0 {
+		return 0, false
+	}
+	return n, true
+}
+
+// budgetSpent reports whether the controller has requested v1alpha1.StaleReanalysisBudget
+// reanalyses for the incident, or its count does not parse.
+func budgetSpent(inc *v1alpha1.Incident) bool {
+	n, ok := staleRequests(inc)
+	return !ok || n >= v1alpha1.StaleReanalysisBudget
+}
+
+// observeBudget sets ReanalysisBudgetExhausted on an Open or Verifying incident: True when its
+// ApplyActionStale episode would call for the controller's request but the budget is spent, and
+// removed otherwise. In other states it is left as it is.
+func observeBudget(inc *v1alpha1.Incident, now time.Time) []change {
+	if s := inc.Status.State; s != v1alpha1.StateOpen && s != v1alpha1.StateVerifying {
+		return nil
+	}
+	stale := inc.GetCondition(v1alpha1.TypeApplyActionStale)
+	if !writerAnswers(inc) || stale.Status != metav1.ConditionTrue || requested(inc, stale) || !budgetSpent(inc) {
+		removeCondition(inc, v1alpha1.TypeReanalysisBudgetExhausted)
+		return nil
+	}
+	n, ok := staleRequests(inc)
+	msg := fmt.Sprintf("the controller has requested %d reanalyses for this incident's stale applyActions, its budget of %d",
+		n, v1alpha1.StaleReanalysisBudget)
+	if !ok {
+		msg = "the controller's count of its reanalysis requests (annotation " + v1alpha1.AnnotationStaleReanalyses +
+			") does not parse, so it requests none"
+	}
+	msg += "; a person must re-run the analysis (the portal's Re-run analysis, spec.reanalysis)"
+	old := inc.GetCondition(v1alpha1.TypeReanalysisBudgetExhausted)
+	c := prv1.Condition{Type: v1alpha1.TypeReanalysisBudgetExhausted, Status: metav1.ConditionTrue,
+		Reason: v1alpha1.ReasonBudgetSpent, Message: msg, LastTransitionTime: metav1.NewTime(now).Rfc3339Copy()}
+	if old.Status == c.Status {
+		c.LastTransitionTime = old.LastTransitionTime
+	}
+	inc.SetConditions(c)
+	if old.Status == metav1.ConditionTrue {
+		return nil
+	}
+	return []change{{reason: string(v1alpha1.TypeReanalysisBudgetExhausted), message: msg,
+		kv: []any{"state", string(inc.Status.State), "requests", n}}}
 }
 
 // writerAnswers reports whether the writer would answer a reanalysis request on inc rather than
