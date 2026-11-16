@@ -161,6 +161,12 @@ func observeApplyAction(inc *v1alpha1.Incident, t *applyTarget, now time.Time) [
 	if old.Status == c.Status {
 		c.LastTransitionTime = old.LastTransitionTime
 	}
+	// An episode whose own reanalysis was answered and is still stale says so: the controller asks
+	// once per episode, so from here only a person can ask again.
+	answered := c.Status == metav1.ConditionTrue && staleAnswered(inc, c)
+	if answered {
+		c.Message += "; " + answeredSuffix(inc)
+	}
 	inc.SetConditions(c)
 
 	kv := []any{"state", string(inc.Status.State), "apiVersion", a.APIVersion, "resource", a.Resource}
@@ -169,8 +175,87 @@ func observeApplyAction(inc *v1alpha1.Incident, t *applyTarget, now time.Time) [
 		return []change{{reason: "ApplyActionStale", message: c.Message, kv: kv}}
 	case c.Status == metav1.ConditionFalse && old.Status == metav1.ConditionTrue:
 		return []change{{reason: "ApplyActionServed", message: c.Message, kv: kv}}
+	case answered && !strings.Contains(old.Message, answeredMarker):
+		return []change{{reason: reasonStaleAfterReanalysis, message: c.Message, kv: kv}}
 	}
 	return nil
+}
+
+// reasonStaleAfterReanalysis is the Event and log reason of an episode whose own reanalysis was
+// answered and still targets an unserved version.
+const reasonStaleAfterReanalysis = "StaleAfterReanalysis"
+
+// answeredMarker begins the suffix of the message of an answered episode that is still stale.
+const answeredMarker = "the reanalysis requested for this episode"
+
+// answeredSuffix is what the message of an answered episode that is still stale adds: when the
+// answering reanalysis was consumed, and that only a person can ask again.
+func answeredSuffix(inc *v1alpha1.Incident) string {
+	at := ""
+	if r := inc.Status.Reanalysis; r != nil && !r.At.IsZero() {
+		at = " (consumed " + r.At.UTC().Format(time.RFC3339) + ")"
+	}
+	return answeredMarker + " was answered" + at + " and still targets an unserved version; " +
+		"a person must re-run the analysis (the portal's Re-run analysis, spec.reanalysis)"
+}
+
+// staleRecord is the controller's record of its reanalysis request for an episode
+// (v1alpha1.AnnotationStaleReanalysis).
+type staleRecord struct {
+	// episode is the condition's lastTransitionTime when the controller asked.
+	episode string
+	// count is status.reanalysis.count when the controller asked.
+	count int32
+}
+
+// episodeOf is the key of the episode c belongs to: its lastTransitionTime, RFC 3339 in UTC.
+func episodeOf(c prv1.Condition) string {
+	return c.LastTransitionTime.UTC().Format(time.RFC3339)
+}
+
+// reanalysisCount is status.reanalysis.count, 0 when the incident has had none.
+func reanalysisCount(inc *v1alpha1.Incident) int32 {
+	if inc.Status.Reanalysis == nil {
+		return 0
+	}
+	return inc.Status.Reanalysis.Count
+}
+
+// recordValue is the annotation value that records a request for c's episode at count.
+func recordValue(c prv1.Condition, count int32) string {
+	return fmt.Sprintf("%s/%d", episodeOf(c), count)
+}
+
+// staleRecordOf parses the controller's record, if inc carries a well-formed one.
+func staleRecordOf(inc *v1alpha1.Incident) (staleRecord, bool) {
+	v, ok := inc.Annotations[v1alpha1.AnnotationStaleReanalysis]
+	if !ok {
+		return staleRecord{}, false
+	}
+	ep, n, ok := strings.Cut(v, "/")
+	if !ok || ep == "" {
+		return staleRecord{}, false
+	}
+	var count int32
+	if _, err := fmt.Sscanf(n, "%d", &count); err != nil || count < 0 {
+		return staleRecord{}, false
+	}
+	return staleRecord{episode: ep, count: count}, true
+}
+
+// requested reports whether the controller has asked for a reanalysis in c's episode.
+func requested(inc *v1alpha1.Incident, c prv1.Condition) bool {
+	r, ok := staleRecordOf(inc)
+	return ok && r.episode == episodeOf(c)
+}
+
+// staleAnswered reports whether the controller's request for c's episode has been answered: it
+// asked in this episode, no request is pending, and the writer has consumed a reanalysis since it
+// asked (status.reanalysis.count grew). Counts, not times: both sides of the comparison come from
+// one writer each.
+func staleAnswered(inc *v1alpha1.Incident, c prv1.Condition) bool {
+	r, ok := staleRecordOf(inc)
+	return ok && r.episode == episodeOf(c) && inc.Spec.Reanalysis == nil && reanalysisCount(inc) > r.count
 }
 
 // removeCondition removes the condition of type ct, if any.
@@ -217,12 +302,14 @@ func (r *targetReads) forget(uid types.UID) {
 
 // staleReanalysisDue reports whether the incident's ApplyActionStale episode calls for the
 // controller's reanalysis request: the writer would answer a request (writerAnswers),
-// ApplyActionStale is True, no request is pending (a person's wins), and no reanalysis was
-// consumed since the condition became True (the episode is answered). A new analysis that
-// targets an unserved version again keeps the condition True, so its episode is still answered:
-// there is one request per episode. A request the writer drops unanswered can only come from a
-// race, the state changing between the request and its consumption; the incident is then no
-// longer one the writer answers, so nothing is filed again.
+// ApplyActionStale is True, no request is pending (a person's wins), and the controller has not
+// asked in this episode (its record, v1alpha1.AnnotationStaleReanalysis, names another episode or
+// none). The record is written in the same patch as the request, so whether an episode was asked
+// for never depends on comparing the writer's clock with the controller's. A new analysis that
+// targets an unserved version again keeps the condition True with the same lastTransitionTime, so
+// the episode stays asked for: there is one request per episode. A request the writer drops
+// unanswered can only come from a race, the state changing between the request and its
+// consumption; the record still names the episode, so nothing is filed again.
 func staleReanalysisDue(inc *v1alpha1.Incident) bool {
 	if !writerAnswers(inc) {
 		return false
@@ -231,10 +318,7 @@ func staleReanalysisDue(inc *v1alpha1.Incident) bool {
 	if c.Status != metav1.ConditionTrue || inc.Spec.Reanalysis != nil {
 		return false
 	}
-	if r := inc.Status.Reanalysis; r != nil && !r.At.Before(&c.LastTransitionTime) {
-		return false
-	}
-	return true
+	return !requested(inc, c)
 }
 
 // writerAnswers reports whether the writer would answer a reanalysis request on inc rather than

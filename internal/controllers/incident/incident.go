@@ -504,9 +504,11 @@ func (e *external) readApplyTarget(inc *v1alpha1.Incident, now time.Time) *apply
 // maxRequestAttempts bounds the conflicts requestReanalysis retries.
 const maxRequestAttempts = 3
 
-// requestReanalysis sets spec.reanalysis to the controller's request, cause ApplyActionStale. It
-// runs after the status write that made ApplyActionStale True, so the episode the request answers
-// is persisted first. It patches spec.reanalysis alone, with a JSON merge patch that carries the
+// requestReanalysis sets spec.reanalysis to the controller's request, cause ApplyActionStale, and
+// in the same patch records the episode it asks for (v1alpha1.AnnotationStaleReanalysis), so the
+// request and its record land together or not at all. It runs after the status write that made
+// ApplyActionStale True, so the episode the request answers is persisted first. It patches
+// spec.reanalysis and that one annotation, with a JSON merge patch that carries the
 // resourceVersion read: a write in between, such as a person's request, makes it conflict, and the
 // incident is read again and the guards checked again before another attempt. The same holds for a
 // reconcile that runs on a cached incident from before the controller's own request: its patch
@@ -519,7 +521,10 @@ func (e *external) requestReanalysis(ctx context.Context, inc *v1alpha1.Incident
 		}
 		episode := cur.GetCondition(v1alpha1.TypeApplyActionStale)
 		patch, err := json.Marshal(map[string]any{
-			"metadata": map[string]any{"resourceVersion": cur.ResourceVersion},
+			"metadata": map[string]any{
+				"resourceVersion": cur.ResourceVersion,
+				"annotations":     map[string]any{v1alpha1.AnnotationStaleReanalysis: recordValue(episode, reanalysisCount(cur))},
+			},
 			"spec": map[string]any{"reanalysis": v1alpha1.ReanalysisRequest{
 				Cause:    v1alpha1.ReanalysisCauseApplyActionStale,
 				Feedback: v1alpha1.ReanalysisFeedbackApplyActionStale,

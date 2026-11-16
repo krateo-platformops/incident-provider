@@ -151,8 +151,12 @@ func TestStaleReanalysisEnvtest(t *testing.T) {
 		})
 		// The new analysis targets another version the cluster does not serve.
 		openWith(ctx, t, kube, auto, "v0")
-		c := waitFor(ctx, t, kube, auto, "True for v0", func(c prv1.Condition) bool {
-			return c.Status == metav1.ConditionTrue && c.Message == "applyAction targets "+widgetsGroup+"/v0 widgets, which this cluster does not serve; served: v2"
+		// The episode's own request was answered and the new analysis is stale too, so the message
+		// keeps its fixed prefix and adds that only a person can ask again (#27).
+		const v0Stale = "applyAction targets " + widgetsGroup + "/v0 widgets, which this cluster does not serve; served: v2"
+		c := waitFor(ctx, t, kube, auto, "True for v0, answered", func(c prv1.Condition) bool {
+			return c.Status == metav1.ConditionTrue && strings.HasPrefix(c.Message, v0Stale+"; ") &&
+				strings.Contains(c.Message, answeredMarker) && strings.Contains(c.Message, "a person must re-run the analysis")
 		})
 		if !c.LastTransitionTime.Equal(&episode.LastTransitionTime) {
 			t.Errorf("lastTransitionTime = %s, want %s: the episode goes on", c.LastTransitionTime, episode.LastTransitionTime)
@@ -165,6 +169,9 @@ func TestStaleReanalysisEnvtest(t *testing.T) {
 		})
 		if n := requestEvents(ctx, t, kube, auto); n != 1 {
 			t.Errorf("%d ReanalysisRequested events, want 1", n)
+		}
+		if n := eventsWithReason(ctx, t, kube, auto, reasonStaleAfterReanalysis); n != 1 {
+			t.Errorf("%d %s events, want 1: entering the answered-and-still-stale state is reported once", n, reasonStaleAfterReanalysis)
 		}
 	})
 
@@ -278,13 +285,19 @@ func holds(t *testing.T, d time.Duration, check func() string) {
 // requestEvents counts the ReanalysisRequested events on inc.
 func requestEvents(ctx context.Context, t *testing.T, kube client.Client, inc *v1alpha1.Incident) int32 {
 	t.Helper()
+	return eventsWithReason(ctx, t, kube, inc, reasonReanalysisRequested)
+}
+
+// eventsWithReason counts the Events on inc with the given reason, folding repeats by Count.
+func eventsWithReason(ctx context.Context, t *testing.T, kube client.Client, inc *v1alpha1.Incident, reason string) int32 {
+	t.Helper()
 	var events corev1.EventList
 	if err := kube.List(ctx, &events, client.InNamespace(inc.Namespace)); err != nil {
 		t.Fatal(err)
 	}
 	var n int32
 	for _, e := range events.Items {
-		if e.InvolvedObject.Name == inc.Name && e.Reason == reasonReanalysisRequested {
+		if e.InvolvedObject.Name == inc.Name && e.Reason == reason {
 			n += max(e.Count, 1)
 		}
 	}
