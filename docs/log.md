@@ -12,6 +12,24 @@ timestamp: 2026-11-10T00:00:00Z
 Curated history — notable changes and decisions, newest first. Full release
 notes live in GitHub Releases. Entries record what was true when written.
 
+## 2026-11-16 — an answered stale episode says so, and is tracked by the controller's own record (unreleased)
+
+On krateo-057, `sre-job-failed-20261113-093517` had been `ApplyActionStale=True` since 2026-11-13
+(it targets `installers` at v0-3-618; served v0-3-667). The controller's one reanalysis for that
+episode was answered by a new analysis that targets the same unserved version, so nothing would ask
+again and nothing on the incident said a person must (#27). The episode also counted as answered by
+comparing `status.reanalysis.at`, stamped by the writer, with the condition's `lastTransitionTime`,
+stamped by the controller, to the second: a writer clock one second behind would make every answered
+episode look unanswered and file a request after each new stale analysis. Changed:
+- **The controller records the episode it asked for**, in the annotation
+  `observability.krateo.io/stale-reanalysis`, written in the same patch as `spec.reanalysis`, and
+  decides "already asked" from it alone. No cross-writer time comparison is left.
+- **An answered episode that is still stale says so**: the `True` message gains a suffix telling a
+  person to re-run the analysis, status and reason unchanged, and one `StaleAfterReanalysis` Event.
+- A person's reanalysis no longer counts as the controller's for the episode.
+
+Upgrading asks once more for every incident whose episode is `True` today (on 057: 1).
+
 ## 2026-11-12 — Closed and Resolved incidents are deleted after 30 days (unreleased)
 
 Incidents were never deleted. On demo, 1953 of 1957 were `Closed`, about 150 more a day, each

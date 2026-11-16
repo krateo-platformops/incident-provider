@@ -2,7 +2,10 @@ package incident
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -36,9 +39,11 @@ func withStale(s metav1.ConditionStatus, reason prv1.ConditionReason, msg string
 func TestObserveApplyAction(t *testing.T) {
 	now := t0.Add(time.Hour)
 	const (
-		gvSnowplow = "composition.krateo.io/v1-12-43 snowplows"
-		staleMsg   = "applyAction targets " + gvSnowplow + ", which this cluster does not serve; served: v1-12-44, v1-12-49"
-		servedMsg  = "applyAction targets " + gvSnowplow + ", which this cluster serves"
+		gvSnowplow  = "composition.krateo.io/v1-12-43 snowplows"
+		staleMsg    = "applyAction targets " + gvSnowplow + ", which this cluster does not serve; served: v1-12-44, v1-12-49"
+		servedMsg   = "applyAction targets " + gvSnowplow + ", which this cluster serves"
+		answeredMsg = "the reanalysis requested for this episode was answered (consumed 2026-09-25T14:30:00Z) and still targets an unserved version; " +
+			"a person must re-run the analysis (the portal's Re-run analysis, spec.reanalysis)"
 	)
 	withTarget := withApplyAction("composition.krateo.io/v1-12-43", "snowplows")
 	cases := []struct {
@@ -71,6 +76,30 @@ func TestObserveApplyAction(t *testing.T) {
 		{name: "still served: the transition time does not change",
 			inc: newIncident(v1alpha1.StateOpen, withTarget, withStale(metav1.ConditionFalse, v1alpha1.ReasonServed, servedMsg, 0)), target: &applyTarget{served: true},
 			want: &prv1.Condition{Status: metav1.ConditionFalse, Reason: v1alpha1.ReasonServed, Message: servedMsg, LastTransitionTime: at(0)}},
+		{name: "asked for this episode and answered, still not served: the message says so once",
+			inc: newIncident(v1alpha1.StateOpen, withTarget, withStale(metav1.ConditionTrue, v1alpha1.ReasonVersionNotServed, staleMsg, 0), recorded(0, 1), func(i *v1alpha1.Incident) {
+				i.Status.Reanalysis = &v1alpha1.Reanalysis{At: at(30 * time.Minute), Count: 2, Cause: v1alpha1.ReanalysisCauseApplyActionStale}
+			}), target: &applyTarget{versions: []string{"v1-12-44", "v1-12-49"}},
+			want: &prv1.Condition{Status: metav1.ConditionTrue, Reason: v1alpha1.ReasonVersionNotServed,
+				Message: staleMsg + "; " + answeredMsg, LastTransitionTime: at(0)},
+			wantChanges: []string{"StaleAfterReanalysis"}},
+		{name: "answered and already saying so: no new change",
+			inc: newIncident(v1alpha1.StateOpen, withTarget, withStale(metav1.ConditionTrue, v1alpha1.ReasonVersionNotServed, staleMsg+"; "+answeredMsg, 0), recorded(0, 1), func(i *v1alpha1.Incident) {
+				i.Status.Reanalysis = &v1alpha1.Reanalysis{At: at(30 * time.Minute), Count: 2, Cause: v1alpha1.ReanalysisCauseApplyActionStale}
+			}), target: &applyTarget{versions: []string{"v1-12-44", "v1-12-49"}},
+			want: &prv1.Condition{Status: metav1.ConditionTrue, Reason: v1alpha1.ReasonVersionNotServed,
+				Message: staleMsg + "; " + answeredMsg, LastTransitionTime: at(0)}},
+		{name: "asked for this episode, not yet consumed: the plain message",
+			inc: newIncident(v1alpha1.StateOpen, withTarget, withStale(metav1.ConditionTrue, v1alpha1.ReasonVersionNotServed, staleMsg, 0), recorded(0, 1), func(i *v1alpha1.Incident) {
+				i.Status.Reanalysis = &v1alpha1.Reanalysis{At: at(-time.Hour), Count: 1, Cause: v1alpha1.ReanalysisCausePerson}
+			}), target: &applyTarget{versions: []string{"v1-12-44", "v1-12-49"}},
+			want: &prv1.Condition{Status: metav1.ConditionTrue, Reason: v1alpha1.ReasonVersionNotServed, Message: staleMsg, LastTransitionTime: at(0)}},
+		{name: "answered, then served: False, the plain served message",
+			inc: newIncident(v1alpha1.StateOpen, withTarget, withStale(metav1.ConditionTrue, v1alpha1.ReasonVersionNotServed, staleMsg+"; "+answeredMsg, 0), recorded(0, 1), func(i *v1alpha1.Incident) {
+				i.Status.Reanalysis = &v1alpha1.Reanalysis{At: at(30 * time.Minute), Count: 2, Cause: v1alpha1.ReanalysisCauseApplyActionStale}
+			}), target: &applyTarget{served: true},
+			want:        &prv1.Condition{Status: metav1.ConditionFalse, Reason: v1alpha1.ReasonServed, Message: servedMsg, LastTransitionTime: metav1.NewTime(now)},
+			wantChanges: []string{"ApplyActionServed"}},
 		{name: "unread: the condition stays",
 			inc:  newIncident(v1alpha1.StateOpen, withTarget, withStale(metav1.ConditionTrue, v1alpha1.ReasonVersionNotServed, staleMsg, 0)),
 			want: &prv1.Condition{Status: metav1.ConditionTrue, Reason: v1alpha1.ReasonVersionNotServed, Message: staleMsg, LastTransitionTime: at(0)}},
@@ -189,6 +218,16 @@ func TestLookupApplyTarget(t *testing.T) {
 	}
 }
 
+// recorded sets the controller's record: it asked in the episode that began at d, at count.
+func recorded(d time.Duration, count int32) incOpt {
+	return func(i *v1alpha1.Incident) {
+		if i.Annotations == nil {
+			i.Annotations = map[string]string{}
+		}
+		i.Annotations[v1alpha1.AnnotationStaleReanalysis] = at(d).UTC().Format(time.RFC3339) + "/" + fmt.Sprint(count)
+	}
+}
+
 func TestStaleReanalysisDue(t *testing.T) {
 	stale := withStale(metav1.ConditionTrue, v1alpha1.ReasonVersionNotServed, "m", 10*time.Minute)
 	consumed := func(d time.Duration) incOpt {
@@ -206,9 +245,16 @@ func TestStaleReanalysisDue(t *testing.T) {
 	}{
 		{name: "Open, stale: due", inc: newIncident(v1alpha1.StateOpen, stale), want: true},
 		{name: "Verifying, stale: due", inc: newIncident(v1alpha1.StateVerifying, withVerifyingSince(0), stale), want: true},
-		{name: "a reanalysis consumed before the episode: due", inc: newIncident(v1alpha1.StateOpen, stale, consumed(5*time.Minute)), want: true},
-		{name: "a reanalysis consumed in the episode: answered", inc: newIncident(v1alpha1.StateOpen, stale, consumed(15*time.Minute))},
-		{name: "a reanalysis consumed as the episode began: answered", inc: newIncident(v1alpha1.StateOpen, stale, consumed(10*time.Minute))},
+		{name: "asked for this episode: not again", inc: newIncident(v1alpha1.StateOpen, stale, recorded(10*time.Minute, 0))},
+		{name: "asked for this episode, answered: not again", inc: newIncident(v1alpha1.StateOpen, stale, recorded(10*time.Minute, 0), consumed(15*time.Minute))},
+		{name: "asked for an earlier episode: due", inc: newIncident(v1alpha1.StateOpen, stale, recorded(2*time.Minute, 0)), want: true},
+		// The writer's clock no longer matters: a reanalysis it stamped before, at, or after the
+		// episode's start decides nothing; only the controller's record does.
+		{name: "a person's reanalysis stamped before the episode, no record: due", inc: newIncident(v1alpha1.StateOpen, stale, consumed(5*time.Minute)), want: true},
+		{name: "a person's reanalysis stamped in the episode, no record: due", inc: newIncident(v1alpha1.StateOpen, stale, consumed(15*time.Minute)), want: true},
+		{name: "a malformed record: due", inc: newIncident(v1alpha1.StateOpen, stale, func(i *v1alpha1.Incident) {
+			i.Annotations = map[string]string{v1alpha1.AnnotationStaleReanalysis: "garbage"}
+		}), want: true},
 		{name: "a request pending: it wins", inc: newIncident(v1alpha1.StateOpen, stale, pending)},
 		{name: "served", inc: newIncident(v1alpha1.StateOpen, withStale(metav1.ConditionFalse, v1alpha1.ReasonServed, "m", 10*time.Minute))},
 		{name: "no condition", inc: newIncident(v1alpha1.StateOpen)},
@@ -245,7 +291,7 @@ func TestRequestReanalysis(t *testing.T) {
 		wantErr     bool
 	}{
 		{name: "no conflict: one patch", wantPatches: []string{
-			`{"metadata":{"resourceVersion":"7"},"spec":{"reanalysis":{"cause":"ApplyActionStale","feedback":"applyAction targets a version this cluster no longer serves"}}}`}},
+			`{"metadata":{"annotations":{"observability.krateo.io/stale-reanalysis":"2026-09-25T14:00:00Z/0"},"resourceVersion":"7"},"spec":{"reanalysis":{"cause":"ApplyActionStale","feedback":"applyAction targets a version this cluster no longer serves"}}}`}},
 		{name: "a conflict, still due: the patch again, with the new resourceVersion", conflicts: 1,
 			fresh: func() *v1alpha1.Incident {
 				i := newIncident(v1alpha1.StateOpen, withApplyAction("x/v1", "widgets"), stale)
@@ -253,8 +299,8 @@ func TestRequestReanalysis(t *testing.T) {
 				return i
 			},
 			wantPatches: []string{
-				`{"metadata":{"resourceVersion":"7"},"spec":{"reanalysis":{"cause":"ApplyActionStale","feedback":"applyAction targets a version this cluster no longer serves"}}}`,
-				`{"metadata":{"resourceVersion":"8"},"spec":{"reanalysis":{"cause":"ApplyActionStale","feedback":"applyAction targets a version this cluster no longer serves"}}}`}},
+				`{"metadata":{"annotations":{"observability.krateo.io/stale-reanalysis":"2026-09-25T14:00:00Z/0"},"resourceVersion":"7"},"spec":{"reanalysis":{"cause":"ApplyActionStale","feedback":"applyAction targets a version this cluster no longer serves"}}}`,
+				`{"metadata":{"annotations":{"observability.krateo.io/stale-reanalysis":"2026-09-25T14:00:00Z/0"},"resourceVersion":"8"},"spec":{"reanalysis":{"cause":"ApplyActionStale","feedback":"applyAction targets a version this cluster no longer serves"}}}`}},
 		{name: "a conflict with a person's request: it wins, no second patch", conflicts: 1,
 			fresh: func() *v1alpha1.Incident {
 				i := newIncident(v1alpha1.StateOpen, withApplyAction("x/v1", "widgets"), stale)
@@ -263,7 +309,7 @@ func TestRequestReanalysis(t *testing.T) {
 				return i
 			},
 			wantPatches: []string{
-				`{"metadata":{"resourceVersion":"7"},"spec":{"reanalysis":{"cause":"ApplyActionStale","feedback":"applyAction targets a version this cluster no longer serves"}}}`}},
+				`{"metadata":{"annotations":{"observability.krateo.io/stale-reanalysis":"2026-09-25T14:00:00Z/0"},"resourceVersion":"7"},"spec":{"reanalysis":{"cause":"ApplyActionStale","feedback":"applyAction targets a version this cluster no longer serves"}}}`}},
 		{name: "conflicts every time: an error", conflicts: maxRequestAttempts, wantErr: true,
 			fresh: func() *v1alpha1.Incident {
 				return newIncident(v1alpha1.StateOpen, withApplyAction("x/v1", "widgets"), stale)
@@ -301,6 +347,104 @@ func TestRequestReanalysis(t *testing.T) {
 				if d := cmp.Diff(tc.wantPatches, patches); d != "" {
 					t.Errorf("patches (-want +got):\n%s", d)
 				}
+			}
+		})
+	}
+}
+
+// TestStaleEpisodeOneRequestPerEpisode drives an episode through the controller's own request path
+// (requestReanalysis applying its merge patch) and the writer's consumption, with the writer's
+// clock behind, level with, and ahead of the controller's: exactly one request per episode in
+// every case, the answered episode says so, and a new episode asks once again.
+func TestStaleEpisodeOneRequestPerEpisode(t *testing.T) {
+	unserved := &applyTarget{versions: []string{"v2"}}
+	for _, skew := range []time.Duration{-time.Second, 0, time.Second} {
+		t.Run(fmt.Sprintf("writer clock %+v", skew), func(t *testing.T) {
+			inc := newIncident(v1alpha1.StateOpen, withApplyAction("x/v1", "widgets"))
+			inc.ResourceVersion = "1"
+			requests := 0
+			k := newKube()
+			k.MockPatch = func(_ context.Context, o client.Object, p client.Patch, _ ...client.PatchOption) error {
+				b, _ := p.Data(nil)
+				var m struct {
+					Metadata struct {
+						Annotations map[string]string `json:"annotations"`
+					} `json:"metadata"`
+					Spec struct {
+						Reanalysis *v1alpha1.ReanalysisRequest `json:"reanalysis"`
+					} `json:"spec"`
+				}
+				if err := json.Unmarshal(b, &m); err != nil {
+					t.Fatalf("patch: %v", err)
+				}
+				cur := o.(*v1alpha1.Incident)
+				if cur.Annotations == nil {
+					cur.Annotations = map[string]string{}
+				}
+				for k, v := range m.Metadata.Annotations {
+					cur.Annotations[k] = v
+				}
+				cur.Spec.Reanalysis = m.Spec.Reanalysis
+				requests++
+				return nil
+			}
+			e := newExternal(k, t0)
+			e.reader = test.NewMockClient()
+			pass := func(now time.Time, target *applyTarget) []change {
+				ch := observeApplyAction(inc, target, now)
+				if staleReanalysisDue(inc) {
+					if err := e.requestReanalysis(context.Background(), inc); err != nil {
+						t.Fatalf("requestReanalysis: %v", err)
+					}
+				}
+				return ch
+			}
+			// The writer consumes the pending request at the controller's time plus skew, and the new
+			// analysis targets an unserved version again.
+			consume := func(controllerNow time.Time) {
+				if inc.Spec.Reanalysis == nil {
+					t.Fatal("no request to consume")
+				}
+				inc.Status.Reanalysis = &v1alpha1.Reanalysis{At: metav1.NewTime(controllerNow.Add(skew)).Rfc3339Copy(),
+					Cause: inc.Spec.Reanalysis.Cause, Count: reanalysisCount(inc) + 1}
+				inc.Spec.Reanalysis = nil
+			}
+
+			start := t0.Add(time.Hour)
+			pass(start, unserved)
+			if requests != 1 {
+				t.Fatalf("after the episode began: %d requests, want 1", requests)
+			}
+			// Consumed in the same second the episode began, as the 11-13 incident on 057 was.
+			consume(start)
+			var reasons []string
+			for i := 1; i <= 5; i++ {
+				for _, c := range pass(start.Add(time.Duration(i)*time.Minute), unserved) {
+					reasons = append(reasons, c.reason)
+				}
+			}
+			if requests != 1 {
+				t.Errorf("answered episode, still stale: %d requests, want 1", requests)
+			}
+			if d := cmp.Diff([]string{reasonStaleAfterReanalysis}, reasons); d != "" {
+				t.Errorf("changes while answered (-want +got):\n%s", d)
+			}
+			if c := inc.GetCondition(v1alpha1.TypeApplyActionStale); !strings.Contains(c.Message, "a person must re-run the analysis") {
+				t.Errorf("answered message %q lacks the re-run hint", c.Message)
+			}
+
+			// Served, then unserved again: a new episode, and one new request.
+			pass(start.Add(10*time.Minute), &applyTarget{served: true})
+			pass(start.Add(20*time.Minute), unserved)
+			if requests != 2 {
+				t.Errorf("new episode: %d requests, want 2", requests)
+			}
+			// A person's request pending in that episode would have won: none is filed over it.
+			consume(start.Add(20 * time.Minute))
+			inc.Spec.Reanalysis = &v1alpha1.ReanalysisRequest{Cause: v1alpha1.ReanalysisCausePerson}
+			pass(start.Add(25*time.Minute), unserved)
+			if requests != 2 {
+				t.Errorf("a person's request pending: %d requests, want 2", requests)
 			}
 		})
 	}

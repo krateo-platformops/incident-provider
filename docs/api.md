@@ -150,6 +150,14 @@ strings and joined with `, ` (e.g. `served: v0-1-26, v0-1-28`), or `none` for
 `ResourceNotFound`. The `False` message is `applyAction targets <apiVersion>
 <resource>, which this cluster serves`.
 
+When the controller's own reanalysis for the episode was answered and the new
+analysis still targets an unserved version (see below), the `True` message
+gains a suffix, with status and reason unchanged:
+
+```
+...; served: <versions>; the reanalysis requested for this episode was answered (consumed <time>) and still targets an unserved version; a person must re-run the analysis (the portal's Re-run analysis, spec.reanalysis)
+```
+
 - It is read while `Open` or `Verifying`, the states in which Apply can be
   sent: once a poll interval, and at once when `applyAction` names another
   target. It is read from discovery each time, never from a cache, so a
@@ -187,16 +195,31 @@ other incident unanswered. It does not ask when
 
 - `spec.reanalysis` is already set: a pending request, a person's, wins and
   is left as it is;
-- `status.reanalysis.at` is at or after the condition's `lastTransitionTime`:
-  a reanalysis was consumed in this episode, so it is answered.
+- it has already asked in this episode. In the same patch as its request it
+  records the episode on the incident, as the annotation
+  `observability.krateo.io/stale-reanalysis: <lastTransitionTime>/<count>`
+  (the condition's `lastTransitionTime` in RFC 3339 UTC, and
+  `status.reanalysis.count` when it asked), and it decides from that record
+  alone. No time the writer stamped is compared with one the controller
+  stamped, so the two clocks may disagree: before this change, a writer clock a
+  second behind made an answered episode look unanswered.
 
 A new analysis that targets an unserved version again keeps the condition
-`True`, with the same `lastTransitionTime`: no second request. The target
-served, then unserved again, starts a new episode, which asks again. Since
+`True`, with the same `lastTransitionTime`: no second request. Once that
+analysis is in (`status.reanalysis.count` grew past the record and no request
+is pending), the condition's message says so, and only a person can ask again,
+with the portal's Re-run analysis; the controller emits one
+`StaleAfterReanalysis` Event when this begins. The target served, then
+unserved again, starts a new episode, which asks again. A person's
+reanalysis does not answer an episode for the controller: if one runs in an
+episode the controller has not asked in, the controller still asks once. Since
 the controller asks only where the writer answers, a request can be dropped
 unanswered only in a race: the incident changes state between the request and
-its consumption. It is then in a state the controller does not ask in, so the
-request is not filed again.
+its consumption. The record still names the episode, so the request is not
+filed again.
+
+Upgrading to a release with this change: an incident whose episode is `True` today has
+no record, so the controller asks once more for it, then records it.
 
 It writes the request with a JSON merge patch of `spec.reanalysis` alone that
 carries the `resourceVersion` it read; on a conflict it reads the incident

@@ -16,6 +16,14 @@ const (
 	ClosedReasonAnalysisFailed = "analysis-failed"
 )
 
+// AnnotationStaleReanalysis is the controller's record of the reanalysis it requested for an
+// ApplyActionStale episode: "<episode>/<count>", where <episode> is the condition's
+// lastTransitionTime (RFC 3339, UTC) and <count> is status.reanalysis.count when it asked (0 if
+// none). The controller writes it in the same patch as its spec.reanalysis, so a request and its
+// record are never apart, and reads only it to decide whether an episode is answered: no time the
+// writer stamped is compared with one the controller stamped. Nothing else writes it.
+const AnnotationStaleReanalysis = "observability.krateo.io/stale-reanalysis"
+
 // LabelAlert carries the name of the Alert that opened an Incident. Writers set it at creation,
 // with the value of spec.alertRef.name, so one alert's incidents list with a label selector in the
 // alert's namespace.
