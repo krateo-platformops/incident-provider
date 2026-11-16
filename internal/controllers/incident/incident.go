@@ -11,11 +11,14 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
+	apiextensionsclient "k8s.io/apiextensions-apiserver/pkg/client/clientset/clientset"
 	"k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -57,6 +60,9 @@ type Options struct {
 	// client of the manager's config. It is never cached: the manager's RESTMapper only learns
 	// new versions, and keeps answering for a version the cluster stopped serving.
 	Discovery discovery.DiscoveryInterface
+	// CRDs reads a CustomResourceDefinition by name, to decide whether a stale applyAction can be
+	// re-targeted. Nil: an apiextensions client of the manager's config, never cached.
+	CRDs func(ctx context.Context, name string) (*apiextensionsv1.CustomResourceDefinition, error)
 }
 
 // Setup adds the Incident controller to the manager.
@@ -82,13 +88,23 @@ func Setup(mgr ctrl.Manager, o Options) error {
 		}
 		disc = d
 	}
+	crds := crdGetter(o.CRDs)
+	if crds == nil {
+		cs, err := apiextensionsclient.NewForConfigAndClient(mgr.GetConfig(), mgr.GetHTTPClient())
+		if err != nil {
+			return fmt.Errorf("failed to create apiextensions client: %w", err)
+		}
+		crds = func(ctx context.Context, name string) (*apiextensionsv1.CustomResourceDefinition, error) {
+			return cs.ApiextensionsV1().CustomResourceDefinitions().Get(ctx, name, metav1.GetOptions{})
+		}
+	}
 
 	r := reconciler.NewReconciler(mgr,
 		resource.ManagedKind(v1alpha1.IncidentGroupVersionKind),
 		// Alerts are read past the cache, one at a time: no informer on every Alert, and a
 		// missing Alert CRD is one failed read, not a cache that never syncs.
 		reconciler.WithExternalConnecter(&connector{kube: mgr.GetClient(), alerts: mgr.GetAPIReader(), cfg: cfg, pods: o.Pods,
-			runs: runs, alertReads: newLastRuns(), discovery: disc, targetReads: newTargetReads(), reader: mgr.GetAPIReader(),
+			runs: runs, alertReads: newLastRuns(), discovery: disc, targetReads: newTargetReads(), crds: crds, reader: mgr.GetAPIReader(),
 			log: log, rec: rec}),
 		reconciler.WithPollInterval(cfg.PollInterval),
 		reconciler.WithPollIntervalHook(runs.pollIntervalHook),
@@ -178,6 +194,8 @@ type connector struct {
 	// discovery and targetReads read whether the cluster serves each applyAction's target.
 	discovery   discovery.DiscoveryInterface
 	targetReads *targetReads
+	// crds reads the CRD of a stale applyAction's target, to decide whether it can be re-targeted.
+	crds crdGetter
 	// reader reads an incident past the cache, to recheck a reanalysis request after a conflict.
 	reader client.Reader
 	log    logging.Logger
@@ -198,6 +216,7 @@ func (c *connector) Connect(_ context.Context, mg resource.Managed) (reconciler.
 		alertReads:  c.alertReads,
 		discovery:   c.discovery,
 		targetReads: c.targetReads,
+		crds:        c.crds,
 		reader:      c.reader,
 		log:         c.log.WithValues("incident", inc.Namespace+"/"+inc.Name),
 		rec:         c.rec,
@@ -260,6 +279,7 @@ type external struct {
 	alertReads  *lastRuns
 	discovery   discovery.DiscoveryInterface
 	targetReads *targetReads
+	crds        crdGetter
 	reader      client.Reader
 	log         logging.Logger
 	rec         event.Recorder
@@ -299,7 +319,8 @@ func (e *external) Observe(ctx context.Context, mg resource.Managed) (reconciler
 	changes, consumed := applySpec(inc, now)
 	e.plan = plan{changes: changes, consumeApplied: consumed}
 	e.plan.changes = append(e.plan.changes, observeAlert(inc, e.cfg, e.readAlert(ctx, inc, now), now)...)
-	e.plan.changes = append(e.plan.changes, observeApplyAction(inc, e.readApplyTarget(inc, now), now)...)
+	e.plan.changes = append(e.plan.changes, observeApplyAction(inc, e.readApplyTarget(ctx, inc, now), now)...)
+	e.plan.changes = append(e.plan.changes, observeBudget(inc, now)...)
 
 	sort.Slice(pods, func(i, j int) bool { return pods[i].CreationTimestamp.Before(&pods[j].CreationTimestamp) })
 	for i := range pods {
@@ -479,7 +500,11 @@ func alertNotFoundErr(err error, name string) bool {
 // poll interval for the same target, and at once for a new one. nil: it was not read. A failed
 // read is logged and not counted, so the next reconcile reads again; it changes no state, like a
 // check that gives no verdict.
-func (e *external) readApplyTarget(inc *v1alpha1.Incident, now time.Time) *applyTarget {
+//
+// When the target is not served but other versions of its resource are, it also decides whether
+// the applyAction can be re-targeted (planRetarget); a failed CRD read is treated like a failed
+// discovery read.
+func (e *external) readApplyTarget(ctx context.Context, inc *v1alpha1.Incident, now time.Time) *applyTarget {
 	a := applyActionOf(inc)
 	if a == nil || e.discovery == nil || e.targetReads == nil {
 		return nil
@@ -496,6 +521,15 @@ func (e *external) readApplyTarget(inc *v1alpha1.Incident, now time.Time) *apply
 		e.log.Info("cannot read whether the cluster serves the applyAction target; ApplyActionStale unchanged",
 			"apiVersion", a.APIVersion, "resource", a.Resource, "error", err.Error())
 		return nil
+	}
+	if !t.served && len(t.versions) > 0 && e.crds != nil {
+		r, err := planRetarget(ctx, e.crds, a, t.versions)
+		if err != nil {
+			e.log.Info("cannot read whether the applyAction can be re-targeted; ApplyActionStale unchanged",
+				"apiVersion", a.APIVersion, "resource", a.Resource, "error", err.Error())
+			return nil
+		}
+		t.retarget = &r
 	}
 	e.targetReads.seen(inc.UID, target, now)
 	return &t
@@ -520,10 +554,15 @@ func (e *external) requestReanalysis(ctx context.Context, inc *v1alpha1.Incident
 			return nil
 		}
 		episode := cur.GetCondition(v1alpha1.TypeApplyActionStale)
+		// staleReanalysisDue checked that it parses and is under the budget.
+		requests, _ := staleRequests(cur)
 		patch, err := json.Marshal(map[string]any{
 			"metadata": map[string]any{
 				"resourceVersion": cur.ResourceVersion,
-				"annotations":     map[string]any{v1alpha1.AnnotationStaleReanalysis: recordValue(episode, reanalysisCount(cur))},
+				"annotations": map[string]any{
+					v1alpha1.AnnotationStaleReanalysis: recordValue(episode, reanalysisCount(cur)),
+					v1alpha1.AnnotationStaleReanalyses: strconv.Itoa(requests + 1),
+				},
 			},
 			"spec": map[string]any{"reanalysis": v1alpha1.ReanalysisRequest{
 				Cause:    v1alpha1.ReanalysisCauseApplyActionStale,

@@ -68,7 +68,7 @@ Lifecycle and checks:
 | `verifyingSince` | date-time | controller | the start of the settle window: when the incident entered `Verifying`, or was applied again while `Verifying`. Set only while `Verifying` |
 | `resolution.by` | `verify` \| `user` \| `alert-gone` \| `analysis-failed`, required | controller | `verify` with `Resolved`; `user`, `alert-gone` or `analysis-failed` with `Closed`. `alert-gone`: the Alert in `spec.alertRef` was deleted. `analysis-failed`: the writer closed the incident because its analysis failed: `spec.closed` carries the annotation `observability.krateo.io/closed-reason: analysis-failed`, and the field managers that own `spec.closed` all own that annotation too (see [overview](./overview.md#closed-by-the-writer)). Any other `spec.closed` is `user` |
 | `resolution.at` | date-time, required | controller | when the incident ended |
-| `conditions[]` | provider-runtime `Condition` | controller | `Ready` and `Synced` from provider-runtime, plus `Reproduced`, `ChecksUnknown`, `AlertGone` and `ApplyActionStale` below |
+| `conditions[]` | provider-runtime `Condition` | controller | `Ready` and `Synced` from provider-runtime, plus `Reproduced`, `ChecksUnknown`, `AlertGone` and `ApplyActionStale` and `ReanalysisBudgetExhausted` below |
 
 Any other exit code, and a timeout, is unknown: it is recorded and changes no
 state; too many in a row stop the script (`ChecksUnknown`).
@@ -138,12 +138,17 @@ Whether this cluster serves the `apiVersion` and `resource` that
 | `True` | `VersionNotServed` | the resource is served, but not at `applyAction.apiVersion`: the portal's Apply would fail |
 | `True` | `ResourceNotFound` | the resource is served at no version of its group (or the group is not served, or `apiVersion` does not parse) |
 | `False` | `Served` | the target is served |
+| `False` | `Retargeted` | the controller moved `applyAction` from a version no longer served to the CRD's storage version (see [Re-targeting](#re-targeting)) |
 
 The `True` message has a fixed format, for agents to match:
 
 ```
 applyAction targets <apiVersion> <resource>, which this cluster does not serve; served: <versions>
 ```
+
+When the resource is served at other versions and the controller could not
+prove a re-target safe, the message adds why, e.g. `; not re-targeted: spec.x
+is not declared in <group>/<version>`.
 
 `<versions>` are the versions of the group that serve the resource, sorted as
 strings and joined with `, ` (e.g. `served: v0-1-26, v0-1-28`), or `none` for
@@ -171,8 +176,41 @@ gains a suffix, with status and reason unchanged:
   or `Verifying` incident has none. In the other states it is left as it is:
   a reanalysis (`Analyzing`) clears `howToFix`, and the condition outlives
   it, so the new analysis continues the episode.
-- The controller never rewrites `applyAction`: its `payload` is written
-  against the schema of the version it names. A reanalysis replaces it.
+- The controller rewrites `applyAction` only to re-target it, below.
+  Otherwise a reanalysis replaces it.
+
+### Re-targeting
+
+When `applyAction.apiVersion` is not served but other versions of its
+resource are, the controller moves the action itself, with no reanalysis,
+when the move is provably version-only:
+
+- the resource is a CRD, and its storage version is served;
+- every field the `payload` sets is declared in that version's schema, with a
+  matching type: a property, or an `additionalProperties` schema. A field kept
+  only by `x-kubernetes-preserve-unknown-fields` is not declared. The
+  top-level `apiVersion`, `kind` and `metadata` are not checked. A `delete`
+  has no payload; a `create`'s payload must name the old `apiVersion`, which
+  moves with it;
+- no script of `howToFix` names the old version, as `<group>/<version>` or
+  as kubectl's `<resource>.<version>.<group>`.
+
+It then sets `applyAction.apiVersion` (and a `create` payload's `apiVersion`)
+to the storage version, and the condition to `False`, reason `Retargeted`:
+
+```
+applyAction re-targeted from <old> to <new> <resource>: <old> is not served, and every field it sets is declared in <new>; review and apply it again
+```
+
+Nothing was approved in advance: a person reviews and applies the re-targeted
+action like any other. The record stays while the new version is served. The
+write carries the `resourceVersion` it read, so it never overwrites an
+analysis the writer wrote in between. Each re-target is an Event and a log line
+with reason `ApplyActionRetargeted`. A CRD read that fails for another reason
+than NotFound changes nothing and is retried. It needs `get` on
+`customresourcedefinitions`, which the chart grants.
+
+Decided by Diego on 2026-11-16 (#28): re-target, then re-approve.
 
 ### The automatic reanalysis
 
@@ -220,6 +258,26 @@ filed again.
 
 Upgrading to a release with this change: an incident whose episode is `True` today has
 no record, so the controller asks once more for it, then records it.
+
+### The budget
+
+The controller requests at most `StaleReanalysisBudget` (3) reanalyses for
+one incident, across all episodes (#28). It counts its own requests in the
+annotation `observability.krateo.io/stale-reanalyses: <n>`, written in the same
+patch as each request. A person's requests are not counted, and a person can
+always ask. An incident without the count that carries the episode record
+counts 1. A count that does not parse counts as the budget spent.
+
+With the budget spent, an episode that would call for a request gets none.
+The incident instead gets the condition `ReanalysisBudgetExhausted`, `True`,
+reason `BudgetSpent`, with one Event when it begins:
+
+```
+the controller has requested 3 reanalyses for this incident's stale applyActions, its budget of 3; a person must re-run the analysis (the portal's Re-run analysis, spec.reanalysis)
+```
+
+It is read while `Open` or `Verifying`, and removed when the episode ends
+(the target is served or re-targeted) or has its request.
 
 It writes the request with a JSON merge patch of `spec.reanalysis` alone that
 carries the `resourceVersion` it read; on a conflict it reads the incident
@@ -274,5 +332,6 @@ reason `ApplyFinished`, its message starting with the phase
 - Constants: `RequesterPolicy`, `MaxApplyOutput`, `ReasonApplyFinished`, the `Apply*` phases, `LabelAlert`, `LabelAnalysis` and `AnalysisHuman`, the `State*`, `Script*`, `ResolvedBy*`,
   `Trigger*`, `Source*`, `Category*`, `Owner*`, `OwnerEvidence*` and `ReanalysisCause*` values,
   `ReanalysisFeedbackApplyActionStale`, `TypeReproduced`,
-  `TypeChecksUnknown`, `TypeAlertGone`, `TypeApplyActionStale` and their reasons.
+  `TypeChecksUnknown`, `TypeAlertGone`, `TypeApplyActionStale`, `TypeReanalysisBudgetExhausted` and their reasons,
+  `AnnotationStaleReanalysis`, `AnnotationStaleReanalyses` and `StaleReanalysisBudget`.
 - `apis.AddToScheme` registers the group.

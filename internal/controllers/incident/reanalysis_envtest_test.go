@@ -11,6 +11,7 @@ import (
 	"github.com/google/go-cmp/cmp"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/util/retry"
 	"k8s.io/utils/ptr"
@@ -190,8 +191,11 @@ func TestStaleReanalysisEnvtest(t *testing.T) {
 	})
 }
 
+// widgetAction patches spec.replicas of widget w1 at version. widgets declare no field, so the
+// controller can never prove it re-targetable: a stale one always takes a reanalysis.
 func widgetAction(version string) *v1alpha1.ApplyAction {
-	return &v1alpha1.ApplyAction{Verb: "delete", APIVersion: widgetsGroup + "/" + version, Resource: "widgets", Namespace: "demo", Name: "w1"}
+	return &v1alpha1.ApplyAction{Verb: "patch", APIVersion: widgetsGroup + "/" + version, Resource: "widgets", Namespace: "demo", Name: "w1",
+		Payload: &runtime.RawExtension{Raw: []byte(`{"spec":{"replicas":2}}`)}}
 }
 
 // newEnvIncident creates an incident as the writer does, with req as its spec.reanalysis.
