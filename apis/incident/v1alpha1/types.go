@@ -658,6 +658,7 @@ type IncidentStatus struct {
 // +kubebuilder:printcolumn:name="Alert",type="string",JSONPath=".spec.alertRef.name"
 // +kubebuilder:printcolumn:name="State",type="string",JSONPath=".status.state"
 // +kubebuilder:printcolumn:name="Age",type="date",JSONPath=".metadata.creationTimestamp"
+// +kubebuilder:selectablefield:JSONPath=".status.state"
 // +kubebuilder:subresource:status
 // +kubebuilder:resource:scope=Namespaced,shortName=inc,categories={krateo,observability}
 // +kubebuilder:metadata:annotations="helm.sh/resource-policy=keep"

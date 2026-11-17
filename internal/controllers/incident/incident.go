@@ -353,6 +353,15 @@ func (e *external) Observe(ctx context.Context, mg resource.Managed) (reconciler
 	e.plan.from = checkFrom(inc, lastRun)
 	// After this pass's own changes: an incident this pass closed has a fresh resolution.at.
 	e.plan.expired = expired(inc, e.cfg, now)
+	if inc.Status.State == v1alpha1.StateClosed {
+		// Once persisted it leaves this controller's cache (CacheByObject), and the Closed
+		// controller takes it over: nothing of it is kept here.
+		e.runs.forget(inc.UID)
+		e.alertReads.forget(inc.UID)
+		if e.targetReads != nil {
+			e.targetReads.forget(inc.UID)
+		}
+	}
 
 	inc.SetConditions(prv1.Available())
 

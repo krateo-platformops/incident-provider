@@ -171,10 +171,10 @@ func run(log logging.Logger, o runOptions) error {
 		LeaderElectionID: "incident-provider.observability.krateo.io",
 		Cache: cache.Options{
 			SyncPeriod: &o.syncPeriod,
-			ByObject: map[client.Object]cache.ByObject{
-				&corev1.Pod{}:       checkObjects,
-				&corev1.ConfigMap{}: checkObjects,
-			},
+			// Incidents: every one but the Closed ones (incident.CacheByObject); the Closed controller
+			// watches those, metadata only, through a cache of its own. managedFields are KEPT here:
+			// closedBy reads them to tell a person's close from the writer's.
+			ByObject: byObject(checkObjects),
 		},
 		Metrics:                metricsserver.Options{BindAddress: ":8080"},
 		HealthProbeBindAddress: ":8081",
@@ -200,4 +200,13 @@ func run(log logging.Logger, o runOptions) error {
 		}
 	}
 	return mgr.Start(ctrl.SetupSignalHandler())
+}
+
+// byObject is the manager's per-kind cache configuration: check pods and their ConfigMaps in the
+// checks namespace only, and Incidents as incident.CacheByObject says.
+func byObject(checks cache.ByObject) map[client.Object]cache.ByObject {
+	m := incident.CacheByObject()
+	m[&corev1.Pod{}] = checks
+	m[&corev1.ConfigMap{}] = checks
+	return m
 }
