@@ -21,6 +21,7 @@ import (
 	"k8s.io/client-go/util/retry"
 	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/config"
 	"sigs.k8s.io/controller-runtime/pkg/envtest"
@@ -84,6 +85,9 @@ func widgetCRD() *apiextensionsv1.CustomResourceDefinition {
 
 const poll = time.Second
 
+// envMgr is the manager of the envtest started last, for tests that read its cache.
+var envMgr ctrl.Manager
+
 // startEnvtest starts an API server with the Incident and widget CRDs, and a manager running the
 // Incident reconciler with disc as its discovery, polling every poll. The checks namespace and
 // demo exist. edits change the controller's Config.
@@ -113,8 +117,10 @@ func startEnvtest(t *testing.T, edits ...func(*Config)) (context.Context, client
 		}
 	}
 	// Each test runs its own manager in this process: the controller names repeat.
+	// The production cache shape: no Closed incident in the manager's cache (CacheByObject).
 	mgr, err := ctrl.NewManager(cfg, ctrl.Options{Scheme: scheme, Metrics: metricsserver.Options{BindAddress: "0"},
-		Controller: config.Controller{SkipNameValidation: ptr.To(true)}})
+		Controller: config.Controller{SkipNameValidation: ptr.To(true)},
+		Cache:      cache.Options{ByObject: CacheByObject()}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -124,7 +130,7 @@ func startEnvtest(t *testing.T, edits ...func(*Config)) (context.Context, client
 	}
 	disc := &switchableDiscovery{DiscoveryClient: dc}
 
-	if err := Setup(mgr, Options{
+	opts := Options{
 		Controller: option.ControllerOptions{
 			Options: controller.Options{
 				Logger:                  logging.NewNopLogger(),
@@ -137,9 +143,14 @@ func startEnvtest(t *testing.T, edits ...func(*Config)) (context.Context, client
 		Checks:    checks,
 		Pods:      CheckPods{Namespace: checksNamespace, Template: template, Timeout: time.Minute},
 		Discovery: disc,
-	}); err != nil {
+	}
+	if err := Setup(mgr, opts); err != nil {
 		t.Fatal(err)
 	}
+	if err := SetupClosed(mgr, opts); err != nil {
+		t.Fatal(err)
+	}
+	envMgr = mgr
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
 	go func() {

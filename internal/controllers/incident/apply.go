@@ -559,9 +559,11 @@ func (e *applyExternal) admit(ctx context.Context, ia *v1alpha1.IncidentApply, n
 		return why, nil, err
 	}
 
+	// Past the cache: the manager does not cache Closed incidents (CacheByObject), and a request
+	// for one must be refused because it is Closed, not because it "does not exist".
 	var inc v1alpha1.Incident
 	name := ia.Spec.IncidentRef.Name
-	err = e.kube.Get(ctx, types.NamespacedName{Namespace: ia.Namespace, Name: name}, &inc)
+	err = e.reader.Get(ctx, types.NamespacedName{Namespace: ia.Namespace, Name: name}, &inc)
 	if apierrors.IsNotFound(err) {
 		return fmt.Sprintf("incident %s does not exist", name), nil, nil
 	}

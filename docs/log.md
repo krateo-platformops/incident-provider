@@ -12,6 +12,27 @@ timestamp: 2026-11-10T00:00:00Z
 Curated history — notable changes and decisions, newest first. Full release
 notes live in GitHub Releases. Entries record what was true when written.
 
+## 2026-11-17 — Closed incidents are no longer held in memory (unreleased)
+
+The controller cached every Incident, Closed ones included, so its memory grew with history. On a
+long-lived cluster with 2,548 Closed incidents (about 48 MB of objects, growing by about 130 a day)
+it was OOMKilled at its 128Mi limit and crashlooped. Retention could not help: none had been
+resolved for 7 days.
+
+- The Incident CRD declares `status.state` as a **selectable field**, so the API server can filter
+  on it (Kubernetes 1.32 or later).
+- The manager caches every Incident **except Closed ones** (`status.state!=Closed`). Closed is the
+  one state nothing leaves. An incident that turns Closed leaves the cache.
+- A **Closed controller** watches Closed incidents' **metadata only**, through a cache of its own
+  with managedFields stripped. When one is deleted, it removes the incident's check pods and
+  ConfigMaps, then the finalizer. For retention it reads the one incident past the cache and
+  deletes it, pinned to its UID, once its retention has passed.
+- A request to run apply on an incident reads it past the cache, so a Closed one is refused as
+  Closed, not as missing.
+
+Memory now follows the open incidents, not the history. Upgrade order: the CRD chart first (the
+field selector needs `selectableFields` on the served CRD), then the controller.
+
 ## 2026-11-16 — an answered stale episode says so, and is tracked by the controller's own record (unreleased)
 
 On krateo-057, `sre-job-failed-20261113-093517` had been `ApplyActionStale=True` since 2026-11-13
