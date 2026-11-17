@@ -61,13 +61,16 @@ func TestClosedEnvtest(t *testing.T) {
 		})
 	})
 
-	t.Run("an Incident created already Closed is never cached", func(t *testing.T) {
-		pre := newEnvIncident(ctx, t, kube, "born-closed", nil)
+	// An Incident is created without a status (the status subresource drops it on create), so it is
+	// cached until the watch delivers the write that makes it Closed. Once out, it stays out.
+	t.Run("an Incident written Closed leaves the cache and stays out", func(t *testing.T) {
+		pre := newEnvIncident(ctx, t, kube, "written-closed", nil)
 		patchSpec(ctx, t, kube, pre, `{"spec":{"closed":true}}`)
 		writeStatus(ctx, t, kube, pre, func(st *v1alpha1.IncidentStatus) {
 			st.State = v1alpha1.StateClosed
 			st.Resolution = &v1alpha1.Resolution{By: v1alpha1.ResolvedByUser, At: metav1.NewTime(time.Now()).Rfc3339Copy()}
 		})
+		eventually(t, "the Closed incident leaves the manager's cache", func() bool { return !cached(pre) })
 		holds(t, 3*poll, func() string {
 			if cached(pre) {
 				return "a Closed incident is in the manager's cache"
