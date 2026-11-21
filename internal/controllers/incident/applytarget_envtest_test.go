@@ -150,6 +150,9 @@ func startEnvtest(t *testing.T, edits ...func(*Config)) (context.Context, client
 	if err := SetupClosed(mgr, opts); err != nil {
 		t.Fatal(err)
 	}
+	if err := SetupResolved(mgr, opts); err != nil {
+		t.Fatal(err)
+	}
 	envMgr = mgr
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)

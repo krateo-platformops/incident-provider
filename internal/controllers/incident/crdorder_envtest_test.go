@@ -86,6 +86,9 @@ func TestControllerBeforeCRDEnvtest(t *testing.T) {
 		if err := SetupClosed(mgr, opts); err != nil {
 			return err
 		}
+		if err := SetupResolved(mgr, opts); err != nil {
+			return err
+		}
 		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 		defer cancel()
 		done := make(chan error, 1)

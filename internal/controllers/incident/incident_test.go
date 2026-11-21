@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -874,69 +875,53 @@ func TestExpired(t *testing.T) {
 	}
 }
 
-// A Closed incident past its retention is deleted by Update, last and pinned to its UID; one
-// within it is left alone, and nothing is written for it.
-func TestUpdateDeletesAnIncidentPastItsRetention(t *testing.T) {
-	inc := newIncident(v1alpha1.StateClosed, resolved(v1alpha1.StateClosed, t0))
-	k := newKube()
-	var pinned *types.UID
-	k.MockDelete = func(_ context.Context, o client.Object, opts ...client.DeleteOption) error {
-		k.calls = append(k.calls, "delete "+kindOf(o)+" "+o.GetName())
-		do := &client.DeleteOptions{}
-		for _, op := range opts {
-			op.ApplyToDelete(do)
-		}
-		if do.Preconditions != nil {
-			pinned = do.Preconditions.UID
-		}
-		return nil
-	}
-	e := newExternal(k, t0.Add(31*24*time.Hour))
-	e.cfg.Retention = 30 * 24 * time.Hour
-	obs, err := e.Observe(context.Background(), inc)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if obs.ResourceUpToDate {
-		t.Fatal("an incident past its retention must reach Update")
-	}
-	if err := e.Update(context.Background(), inc); err != nil {
-		t.Fatal(err)
-	}
-	if d := cmp.Diff([]string{"delete incident " + inc.Name}, k.calls); d != "" {
-		t.Errorf("calls (-want +got):\n%s", d)
-	}
-	if pinned == nil || *pinned != inc.UID {
-		t.Errorf("the delete is not pinned to the incident's UID: %v", pinned)
-	}
-
-	within := newIncident(v1alpha1.StateClosed, resolved(v1alpha1.StateClosed, t0))
-	k2 := newKube()
-	e2 := newExternal(k2, t0.Add(29*24*time.Hour))
-	e2.cfg.Retention = 30 * 24 * time.Hour
-	obs, err = e2.Observe(context.Background(), within)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !obs.ResourceUpToDate {
-		t.Errorf("within its retention, nothing to do: %+v", obs)
+// The Incident controller never deletes an incident, past its retention or not: provider-runtime
+// writes the status after a successful Update, onto the object a delete there had just removed.
+// Retention belongs to the Resolved and Closed controllers (retain).
+func TestUpdateNeverDeletesAnIncidentPastItsRetention(t *testing.T) {
+	for _, state := range []v1alpha1.State{v1alpha1.StateResolved, v1alpha1.StateClosed} {
+		t.Run(string(state), func(t *testing.T) {
+			inc := newIncident(state, resolved(state, t0))
+			k := newKube()
+			e := newExternal(k, t0.Add(365*24*time.Hour))
+			e.cfg.Retention = 30 * 24 * time.Hour
+			obs, err := e.Observe(context.Background(), inc)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !obs.ResourceUpToDate {
+				t.Errorf("an incident past its retention, with nothing else to do, must not reach Update: %+v", obs)
+			}
+			if err := e.Update(context.Background(), inc); err != nil {
+				t.Fatal(err)
+			}
+			for _, c := range k.calls {
+				if strings.HasPrefix(c, "delete incident") {
+					t.Errorf("the Incident controller deleted the incident: %v", k.calls)
+				}
+			}
+		})
 	}
 }
 
-// Closing an incident in this pass starts its retention now: it is not deleted in the same pass
-// even if the retention is shorter than the time since it was created.
+// Closing an incident in this pass starts its retention now: resolution.at is this pass's time,
+// so retention counts from the close, not from when the incident was created.
 func TestClosingStartsTheRetention(t *testing.T) {
 	inc := newIncident(v1alpha1.StateOpen, withSpec(false, false), func(i *v1alpha1.Incident) { i.Spec.Closed = true })
 	k := newKube()
-	e := newExternal(k, t0.Add(365*24*time.Hour))
+	now := t0.Add(365 * 24 * time.Hour)
+	e := newExternal(k, now)
 	e.cfg.Retention = time.Hour
 	if _, err := e.Observe(context.Background(), inc); err != nil {
 		t.Fatal(err)
 	}
-	if e.plan.expired {
-		t.Fatal("an incident closed in this pass was marked expired")
-	}
 	if inc.Status.State != v1alpha1.StateClosed {
 		t.Fatalf("state %s, want Closed", inc.Status.State)
+	}
+	if inc.Status.Resolution == nil || !inc.Status.Resolution.At.Time.Equal(now.Truncate(time.Second)) {
+		t.Fatalf("resolution %+v, want at %v", inc.Status.Resolution, now)
+	}
+	if expired(inc, e.cfg, now) {
+		t.Fatal("an incident closed in this pass is already past its retention")
 	}
 }

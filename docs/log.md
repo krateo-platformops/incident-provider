@@ -12,6 +12,21 @@ timestamp: 2026-11-10T00:00:00Z
 Curated history — notable changes and decisions, newest first. Full release
 notes live in GitHub Releases. Entries record what was true when written.
 
+## 2026-11-21 — retention deletes without an error per incident (unreleased)
+
+- The Incident controller deleted a `Resolved` incident past its retention from its own
+  `Update`, and provider-runtime then wrote the status onto the deleted object: every retention
+  delete logged a status conflict and a not-found error (99 errors for 49 deletions in one sweep).
+  Nothing was deleted wrongly; the errors were noise that alerting on controller errors would read
+  as a fault.
+- A `resolved-incident` controller now retains `Resolved` incidents, as the `closed-incident`
+  controller does `Closed` ones; the Incident controller never deletes an incident. Both use one
+  rule (`retain`): read the incident past the cache, delete it once `status.resolution.at` plus the
+  retention has passed, pinned to the UID **and resourceVersion** read, so an incident recreated or
+  changed (reopened) since the read is read again rather than deleted.
+- Retention is now exact: a `Resolved` incident is deleted at `resolution.at` plus the retention,
+  not at its next poll (up to one poll interval late).
+
 ## 2026-11-17 — Closed incidents are no longer held in memory (unreleased)
 
 The controller cached every Incident, Closed ones included, so its memory grew with history. On a

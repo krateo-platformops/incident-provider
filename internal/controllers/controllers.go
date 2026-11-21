@@ -15,5 +15,8 @@ func Setup(mgr ctrl.Manager, o incident.Options, a incident.ApplyOptions) error 
 	if err := incident.SetupClosed(mgr, o); err != nil {
 		return err
 	}
+	if err := incident.SetupResolved(mgr, o); err != nil {
+		return err
+	}
 	return incident.SetupApply(mgr, a)
 }
