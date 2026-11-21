@@ -21,7 +21,7 @@ sets its default. The chart sets them from its values.
 | `-no-verdict-runs` | `NO_VERDICT_RUNS` | `6` | consecutive precondition or verify runs without exit `0` or `1` after which the script stops and the incident gets `ChecksUnknown=True`; `0` disables this bound |
 | `-no-verdict-for` | `NO_VERDICT_FOR` | `24h` | how long runs may give no exit `0` or `1` before the script stops, from the end of the first run of the streak; `0` disables this bound |
 | `-alert-gone-grace` | `ALERT_GONE_GRACE` | `10m` | how long an `Open` or `Verifying` incident's Alert must stay NotFound before the incident is closed with `resolution.by: alert-gone` |
-| `-retention` | `RETENTION` | `720h` | how long a `Closed` or `Resolved` incident is kept after `status.resolution.at` before the controller deletes it (within one poll interval); `0` keeps them for ever. An incident with no `resolution.at` is never deleted |
+| `-retention` | `RETENTION` | `720h` | how long a `Closed` or `Resolved` incident is kept after `status.resolution.at` before it is deleted (when `status.resolution.at` plus the retention passes, not at a poll); `0` keeps them for ever. An incident with no `resolution.at` is never deleted |
 | `-check-timeout` | `CHECK_TIMEOUT` | `1m` | deadline of one check run, the pod's `activeDeadlineSeconds` |
 | `-checks-namespace` | `CHECKS_NAMESPACE` | none, required | namespace the check pods run in |
 | `-apply-timeout` | `APPLY_TIMEOUT` | `2m` | deadline of one IncidentApply run, the apply pod's `activeDeadlineSeconds` |

@@ -54,14 +54,14 @@ func reqOf(inc *v1alpha1.Incident) reconcile.Request {
 }
 
 func TestClosedRetention(t *testing.T) {
-	t.Run("within retention: kept, requeued at most maxClosedRequeue later", func(t *testing.T) {
+	t.Run("within retention: kept, requeued at most maxRetentionRequeue later", func(t *testing.T) {
 		r, kube, inc, _ := closedFixture(t, 24*time.Hour, false)
 		res, err := r.Reconcile(context.Background(), reqOf(inc))
 		if err != nil {
 			t.Fatal(err)
 		}
-		if res.RequeueAfter != maxClosedRequeue {
-			t.Errorf("RequeueAfter = %v, want %v (29 days remain)", res.RequeueAfter, maxClosedRequeue)
+		if res.RequeueAfter != maxRetentionRequeue {
+			t.Errorf("RequeueAfter = %v, want %v (29 days remain)", res.RequeueAfter, maxRetentionRequeue)
 		}
 		if err := kube.Get(context.Background(), client.ObjectKeyFromObject(inc), &v1alpha1.Incident{}); err != nil {
 			t.Errorf("incident gone: %v", err)

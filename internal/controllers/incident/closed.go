@@ -40,16 +40,13 @@ func CacheByObject() map[client.Object]cache.ByObject {
 	}
 }
 
-// maxClosedRequeue bounds how long a Closed incident waits for its retention before it is read again.
-const maxClosedRequeue = 6 * time.Hour
-
 // SetupClosed adds the controller of Closed incidents. It watches their METADATA only, through a
 // cache of its own (the manager's cache holds one configuration per kind, and the Incident entry
 // excludes Closed). It does the two things a Closed incident still needs:
 //   - deletion: it removes the check pods and ConfigMaps left for the incident, then provider-
 //     runtime's finalizer, so a Closed incident deleted by a person or by retention goes away;
 //   - retention: it reads the one incident past any cache (status.resolution.at is not metadata)
-//     and deletes it once Closed for longer than the retention, pinned to its UID.
+//     and deletes it once Closed for longer than the retention (retain).
 //
 // Memory: metadata of Closed incidents, managedFields stripped (nothing here reads them; the
 // Incident controller's closedBy does, and its cache keeps them), and one incident at a time.
@@ -118,22 +115,7 @@ func (r *closedReconciler) Reconcile(ctx context.Context, req reconcile.Request)
 		// Recreated, or not Closed after all: the Incident controller owns it.
 		return reconcile.Result{}, nil
 	}
-	now := r.now()
-	if !expired(inc, r.cfg, now) {
-		if inc.Status.Resolution == nil || inc.Status.Resolution.At.IsZero() {
-			return reconcile.Result{}, nil
-		}
-		wait := inc.Status.Resolution.At.Add(r.cfg.Retention).Sub(now) + time.Second
-		return reconcile.Result{RequeueAfter: min(wait, maxClosedRequeue)}, nil
-	}
-	uid := inc.UID
-	if err := r.kube.Delete(ctx, inc, client.Preconditions{UID: &uid}); resource.IgnoreNotFound(err) != nil {
-		return reconcile.Result{}, fmt.Errorf("cannot delete incident past its retention: %w", err)
-	}
-	r.log.Info("deleted after its retention", "incident", req.String(), "state", string(inc.Status.State),
-		"resolvedBy", string(inc.Status.Resolution.By), "resolvedAt", inc.Status.Resolution.At.UTC().Format(time.RFC3339),
-		"retention", r.cfg.Retention.String())
-	return reconcile.Result{}, nil
+	return retain(ctx, r.kube, inc, r.cfg, r.now(), r.log)
 }
 
 // finalize deletes the incident's check pods and ConfigMaps, then removes provider-runtime's
