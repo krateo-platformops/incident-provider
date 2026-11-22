@@ -26,10 +26,15 @@ func exit(code int32) *int32 { return ptr.To(code) }
 
 type incOpt func(*v1alpha1.Incident)
 
+// newIncident is an incident of the first analysis (status.reanalysis unset) whose verify was
+// already probed and whose first-run no-verdict was already asked for: the tests written before
+// the probe and the CheckNoVerdict request keep describing what they did. withFirstPass clears both
+// records, for the tests of that first pass.
 func newIncident(state v1alpha1.State, opts ...incOpt) *v1alpha1.Incident {
 	inc := &v1alpha1.Incident{
-		ObjectMeta: metav1.ObjectMeta{Name: "cd-not-ready-20260925-140000", Namespace: "krateo-system", UID: "0b7c3a3e-1d2f-4c56-9a8b-7e6f5d4c3b2a"},
-		Spec:       v1alpha1.IncidentSpec{AlertRef: v1alpha1.AlertRef{Name: "cd-not-ready", Namespace: "krateo-system"}},
+		ObjectMeta: metav1.ObjectMeta{Name: "cd-not-ready-20260925-140000", Namespace: "krateo-system", UID: "0b7c3a3e-1d2f-4c56-9a8b-7e6f5d4c3b2a",
+			Annotations: map[string]string{v1alpha1.AnnotationVerifyProbed: "0", v1alpha1.AnnotationNoVerdictReanalysis: "0"}},
+		Spec: v1alpha1.IncidentSpec{AlertRef: v1alpha1.AlertRef{Name: "cd-not-ready", Namespace: "krateo-system"}},
 		Status: v1alpha1.IncidentStatus{
 			State:    state,
 			HowToFix: &v1alpha1.HowToFix{Precondition: "exit 1", Apply: "true", Verify: "exit 0"},
@@ -39,6 +44,14 @@ func newIncident(state v1alpha1.State, opts ...incOpt) *v1alpha1.Incident {
 		o(inc)
 	}
 	return inc
+}
+
+// withFirstPass clears newIncident's probe and no-verdict records: the analysis' first pass.
+func withFirstPass() incOpt {
+	return func(inc *v1alpha1.Incident) {
+		delete(inc.Annotations, v1alpha1.AnnotationVerifyProbed)
+		delete(inc.Annotations, v1alpha1.AnnotationNoVerdictReanalysis)
+	}
 }
 
 func withLastChecks(lc v1alpha1.LastChecks) incOpt {

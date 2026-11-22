@@ -111,11 +111,13 @@ spec:
                 properties:
                   cause:
                     default: Person
-                    description: 'Cause is who asked: Person (the default) or ApplyActionStale
-                      (the controller).'
+                    description: |-
+                      Cause is who asked: Person (the default), or the controller: ApplyActionStale or
+                      CheckNoVerdict.
                     enum:
                     - Person
                     - ApplyActionStale
+                    - CheckNoVerdict
                     type: string
                   feedback:
                     description: Feedback is what the person asking found wrong with
@@ -463,6 +465,7 @@ spec:
                     enum:
                     - Person
                     - ApplyActionStale
+                    - CheckNoVerdict
                     type: string
                   count:
                     description: Count is how many reanalyses the incident has had.

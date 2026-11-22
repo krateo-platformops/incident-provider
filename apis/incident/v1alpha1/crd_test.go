@@ -752,7 +752,8 @@ func TestConstantsMatchCRD(t *testing.T) {
 	if d := cmp.Diff(kinds, enum(rc.Properties["ownerEvidence"].Items.Schema.Properties["kind"])); d != "" {
 		t.Errorf("status.rootCause.ownerEvidence[].kind enum differs from the OwnerEvidenceKind constants (-want +got):\n%s", d)
 	}
-	causes := []string{string(v1alpha1.ReanalysisCausePerson), string(v1alpha1.ReanalysisCauseApplyActionStale)}
+	causes := []string{string(v1alpha1.ReanalysisCausePerson), string(v1alpha1.ReanalysisCauseApplyActionStale),
+		string(v1alpha1.ReanalysisCauseCheckNoVerdict)}
 	for path, p := range map[string]apiextensions.JSONSchemaProps{
 		"spec.reanalysis.cause":   s.Properties["spec"].Properties["reanalysis"].Properties["cause"],
 		"status.reanalysis.cause": st.Properties["reanalysis"].Properties["cause"],

@@ -13,3 +13,8 @@ keywords:
   - incidents
 sources:
   - https://github.com/krateo-platformops/incident-provider
+annotations:
+  # This release files spec.reanalysis with cause CheckNoVerdict. alert-provider before 0.2.87 takes
+  # an unknown cause as a person's, and closes the incident when the answer fails instead of
+  # returning it to Open. The installer's pin gate enforces the floor in both directions.
+  krateo.io/requires-alert-provider: ">= 0.2.87"

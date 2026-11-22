@@ -20,7 +20,7 @@ a human closes it, its Alert is deleted, or its analysis fails.
 | Actor | Writes |
 |---|---|
 | alert-provider (the writer) | creates the Incident with its label and `spec`; writes the analysis and `howToFix`; sets `Analyzing`, then `Open`; consumes `spec.reanalysis`; closes a failed analysis: `spec.closed` with the annotation `observability.krateo.io/closed-reason: analysis-failed` |
-| incident-provider | runs precondition and verify; writes `lastChecks`, `verifyingSince`, every other state transition, `resolution` and the conditions; sets `spec.reanalysis` (`cause: ApplyActionStale`) once when the cluster stops serving `applyAction`'s target |
+| incident-provider | runs precondition and verify; writes `lastChecks`, `verifyingSince`, every other state transition, `resolution` and the conditions; sets `spec.reanalysis` (`cause: ApplyActionStale`) once when the cluster stops serving `applyAction`'s target, and (`cause: CheckNoVerdict`) once per analysis when a check's first run exits with neither 0 nor 1; runs an Open incident's verify once, read-only, on its first pass (the probe) |
 | a human, through the portal | `spec.applied` ("I applied it", or Apply), `spec.closed` (Close) and `spec.reanalysis` (Re-run analysis), with their own token and the `krateo-incident-responder` role; an IncidentApply (Run apply), which has the controller run the apply script with their own rights |
 
 Field by field: [api](./api.md).
@@ -225,7 +225,7 @@ with the attributes `incident` (`namespace/name`) and `reason`:
 | `AlertGone` | `state`, `alert` | the Alert in `spec.alertRef` was first found missing |
 | `ApplyActionStale` | `state`, `apiVersion`, `resource` | `ApplyActionStale` became `True`: the cluster does not serve the target of `howToFix.applyAction`; the message is the condition's |
 | `ApplyActionServed` | `state`, `apiVersion`, `resource` | `ApplyActionStale` went from `True` to `False` |
-| `ReanalysisRequested` | `cause`, `state` | the controller set `spec.reanalysis` (`cause: ApplyActionStale`); the message ends with the condition's |
+| `ReanalysisRequested` | `cause`, `state` (and `script`, `exit` for CheckNoVerdict) | the controller set `spec.reanalysis`: `cause: ApplyActionStale`, the message ending with the condition's; or `cause: CheckNoVerdict`, naming the script and its exit code |
 
 To alert on stuck incidents, match `ChecksUnknown=True` on the Incident, or
 the `ChecksUnknown` log line; for incidents left `Open` too long, compare the

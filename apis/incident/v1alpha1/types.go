@@ -37,6 +37,25 @@ const AnnotationStaleReanalyses = "observability.krateo.io/stale-reanalyses"
 // applyAction went stale, across all episodes. A person can always request more.
 const StaleReanalysisBudget = 3
 
+// AnnotationNoVerdictReanalysis records the analysis the controller last requested a CheckNoVerdict
+// reanalysis for: status.reanalysis.count when it asked (0 for the first analysis). A reanalysis
+// clears status.lastChecks and moves the count, so the next analysis' first runs decide again;
+// within one analysis the controller asks once. It is written in the same patch as the request.
+const AnnotationNoVerdictReanalysis = "observability.krateo.io/noverdict-reanalysis"
+
+// AnnotationNoVerdictReanalyses is how many CheckNoVerdict reanalyses the controller has requested
+// for the incident: a decimal count, written in the same patch as each request. The controller
+// stops at NoVerdictReanalysisBudget; a value that does not parse counts as the budget spent.
+const AnnotationNoVerdictReanalyses = "observability.krateo.io/noverdict-reanalyses"
+
+// NoVerdictReanalysisBudget is how many CheckNoVerdict reanalyses the controller requests for one
+// incident. Past it, a check without a verdict runs on to ChecksUnknown as before.
+const NoVerdictReanalysisBudget = 3
+
+// AnnotationVerifyProbed records the analysis whose verify the controller has run once, read-only,
+// before the incident needed it (the first-pass probe): status.reanalysis.count of that analysis.
+const AnnotationVerifyProbed = "observability.krateo.io/verify-probed"
+
 // LabelAlert carries the name of the Alert that opened an Incident. Writers set it at creation,
 // with the value of spec.alertRef.name, so one alert's incidents list with a label selector in the
 // alert's namespace.
@@ -310,7 +329,7 @@ type IncidentSpec struct {
 }
 
 // ReanalysisCause is who, or what, asked for a reanalysis.
-// +kubebuilder:validation:Enum=Person;ApplyActionStale
+// +kubebuilder:validation:Enum=Person;ApplyActionStale;CheckNoVerdict
 type ReanalysisCause string
 
 const (
@@ -322,6 +341,11 @@ const (
 	// could not prove a re-target safe. It asks once per episode of the condition, and at most
 	// StaleReanalysisBudget times per incident.
 	ReanalysisCauseApplyActionStale ReanalysisCause = "ApplyActionStale"
+	// ReanalysisCauseCheckNoVerdict: the controller asked, because a check's first run in the
+	// current analysis exited with a code other than 0 or 1: the script can never give a verdict.
+	// The feedback carries the script, its exit code and its output. Once per analysis, at most
+	// NoVerdictReanalysisBudget times per incident.
+	ReanalysisCauseCheckNoVerdict ReanalysisCause = "CheckNoVerdict"
 )
 
 // ReanalysisFeedbackApplyActionStale is the feedback of the controller's request.
@@ -329,7 +353,8 @@ const ReanalysisFeedbackApplyActionStale = "applyAction targets a version this c
 
 // ReanalysisRequest is a request for a new root-cause analysis.
 type ReanalysisRequest struct {
-	// Cause is who asked: Person (the default) or ApplyActionStale (the controller).
+	// Cause is who asked: Person (the default), or the controller: ApplyActionStale or
+	// CheckNoVerdict.
 	// +kubebuilder:default=Person
 	// +optional
 	Cause ReanalysisCause `json:"cause,omitempty"`
