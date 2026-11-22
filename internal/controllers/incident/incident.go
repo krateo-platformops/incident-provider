@@ -243,6 +243,13 @@ type plan struct {
 	stale []corev1.Pod
 	// live is the running check pod of the current script.
 	live *corev1.Pod
+	// noVerdict is a check's first run in this analysis that exited with neither 0 nor 1: the
+	// controller asks for a CheckNoVerdict reanalysis when noVerdictReanalysisDue (see noverdict.go).
+	noVerdict *firstNoVerdict
+	// probe means the verify probe is due; probing means one is running; probed is the analysis a
+	// finished probe ran for, to record (AnnotationVerifyProbed).
+	probe, probing bool
+	probed         string
 }
 
 func (p plan) String() string {
@@ -255,6 +262,15 @@ func (p plan) String() string {
 	}
 	if p.requestReanalysis {
 		parts = append(parts, "reanalysis to request")
+	}
+	if p.noVerdict != nil {
+		parts = append(parts, string(p.noVerdict.script)+" gave no verdict on its first run")
+	}
+	if p.probe {
+		parts = append(parts, "verify probe due")
+	}
+	if p.probed != "" {
+		parts = append(parts, "verify probe finished")
 	}
 	if n := len(p.stale); n > 0 {
 		parts = append(parts, fmt.Sprintf("%d check pod(s) to delete", n))
@@ -323,6 +339,10 @@ func (e *external) Observe(ctx context.Context, mg resource.Managed) (reconciler
 		if pod.DeletionTimestamp != nil {
 			continue
 		}
+		if isProbe(pod) {
+			e.observeProbe(inc, pod, now)
+			continue
+		}
 		r, done := resultOf(pod, e.cfg.CheckTimeout, now)
 		switch {
 		case !done && r.script == currentScript(inc) && e.plan.live == nil:
@@ -334,8 +354,12 @@ func (e *external) Observe(ctx context.Context, mg resource.Managed) (reconciler
 			// has moved on. A result recorded before, whose pod outlived a failed delete, records
 			// the same result again and changes nothing.
 			if r.script == currentScript(inc) {
+				first := firstRun(inc, r.script)
 				e.plan.changes = append(e.plan.changes, record(inc, e.cfg, r, now)...)
 				e.runs.seen(inc.UID, r.at)
+				if f := noVerdictOnFirstRun(r, first); f != nil && e.plan.noVerdict == nil {
+					e.plan.noVerdict = f
+				}
 			}
 			e.plan.stale = append(e.plan.stale, *pod)
 		}
@@ -345,6 +369,10 @@ func (e *external) Observe(ctx context.Context, mg resource.Managed) (reconciler
 	lastRun := e.runs.get(inc.UID)
 	e.plan.due = e.plan.live == nil && checkDue(inc, e.cfg, lastRun, now)
 	e.plan.requestReanalysis = staleReanalysisDue(inc)
+	if e.plan.noVerdict != nil && !noVerdictReanalysisDue(inc) {
+		e.plan.noVerdict = nil
+	}
+	e.plan.probe = !e.plan.probing && e.plan.probed == "" && e.plan.noVerdict == nil && probeDue(inc)
 	e.plan.from = checkFrom(inc, lastRun)
 	if inc.Status.State == v1alpha1.StateClosed {
 		// Once persisted it leaves this controller's cache (CacheByObject), and the Closed
@@ -358,7 +386,8 @@ func (e *external) Observe(ctx context.Context, mg resource.Managed) (reconciler
 
 	inc.SetConditions(prv1.Available())
 
-	if e.plan.dirty || len(e.plan.stale) > 0 || e.plan.due || e.plan.requestReanalysis {
+	if e.plan.dirty || len(e.plan.stale) > 0 || e.plan.due || e.plan.requestReanalysis ||
+		e.plan.noVerdict != nil || e.plan.probe || e.plan.probed != "" {
 		return reconciler.ExternalObservation{ResourceExists: true, ResourceUpToDate: false, Diff: e.plan.String()}, nil
 	}
 	return reconciler.ExternalObservation{ResourceExists: true, ResourceUpToDate: true}, nil
@@ -400,6 +429,23 @@ func (e *external) Update(ctx context.Context, mg resource.Managed) error {
 	}
 	if e.plan.requestReanalysis {
 		if err := e.requestReanalysis(ctx, inc); err != nil {
+			return err
+		}
+	}
+	if e.plan.probed != "" {
+		if err := e.markProbed(ctx, inc, e.plan.probed); err != nil {
+			return err
+		}
+	}
+	if e.plan.noVerdict != nil {
+		requested, err := e.requestNoVerdictReanalysis(ctx, inc, *e.plan.noVerdict)
+		if err != nil || requested {
+			// The writer re-analyzes now: no check or probe of this analysis is worth starting.
+			return err
+		}
+	}
+	if e.plan.probe {
+		if err := e.startProbe(ctx, inc); err != nil {
 			return err
 		}
 	}

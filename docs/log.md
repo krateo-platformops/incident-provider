@@ -12,6 +12,21 @@ timestamp: 2026-11-10T00:00:00Z
 Curated history — notable changes and decisions, newest first. Full release
 notes live in GitHub Releases. Entries record what was true when written.
 
+## 2026-11-22 — a check that cannot answer is sent back at once (unreleased)
+
+- A precondition or verify whose **first** run in an analysis exits with neither 0 nor 1 is a
+  broken script (a jq program indexing a string, a resource type the cluster does not serve), not a
+  slow problem. The controller now requests a reanalysis at once, `cause: CheckNoVerdict`, with the
+  script, its exit code and its output as feedback, instead of running it `NO_VERDICT_RUNS` times
+  into ChecksUnknown. Once per analysis, at most `NoVerdictReanalysisBudget` (3) times per
+  incident; past that, the old path applies. A run without an exit code (a timeout) is left to the
+  streak.
+- verify first ran only once an incident was Verifying, after the fix. An Open incident's first
+  pass now runs it once, read-only, through the same check-pod path (the probe), so a verify that
+  cannot answer is caught before anyone applies the fix. The probe's exit 0 or 1 is discarded and
+  never moves the incident.
+- Requires alert-provider >= 0.2.87, which knows the new cause.
+
 ## 2026-11-21 — retention deletes without an error per incident (unreleased)
 
 - The Incident controller deleted a `Resolved` incident past its retention from its own
