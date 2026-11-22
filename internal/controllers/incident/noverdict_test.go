@@ -212,7 +212,7 @@ func TestTheFirstPassStartsTheVerifyProbe(t *testing.T) {
 	if !probe || !cm {
 		t.Errorf("probe pod %t, ConfigMap %t: %v", probe, cm, k.calls)
 	}
-	if !isProbe(ptr.To(pods.ProbePod(inc))) {
+	if !isProbe(pods.ProbePod(inc)) {
 		t.Error("the probe pod is not labelled a probe")
 	}
 }
