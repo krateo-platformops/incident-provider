@@ -1,0 +1,14 @@
+# helm template has no cluster: both lookups are empty, and the render must still work.
+suite: the check NetworkPolicy renders without a cluster
+templates:
+  - templates/checks.yaml
+release:
+  name: incident-provider
+  namespace: krateo-system
+tests:
+  - it: allows no egress
+    documentSelector: {path: kind, value: NetworkPolicy}
+    asserts:
+      - equal:
+          path: spec.egress
+          value: []

@@ -1,0 +1,77 @@
+# The check pods' only egress is the apiserver, found by lookup, which helm template turns off: the
+# kubernetesProvider fakes the cluster, so the lookups answer. On 2026-11-23 a control-plane repair
+# left the EndpointSlice without an address for a moment; the chart rendered a policy without the
+# endpoint, which was applied, and put it back 2.4 s later.
+# Ports in the faked objects are floats: the fake cluster cannot copy an integer, and 443.0 prints 443.
+suite: the check NetworkPolicy never loses the apiserver's endpoint to a momentary lookup
+templates:
+  - templates/checks.yaml
+release:
+  name: incident-provider
+  namespace: krateo-system
+kubernetesProvider:
+  scheme:
+    "v1/Service":
+      gvr: {version: v1, resource: services}
+      namespaced: true
+    "discovery.k8s.io/v1/EndpointSlice":
+      gvr: {group: discovery.k8s.io, version: v1, resource: endpointslices}
+      namespaced: true
+  objects:
+    - apiVersion: v1
+      kind: Service
+      metadata: {name: kubernetes, namespace: default}
+      spec:
+        clusterIPs: ["34.118.224.1"]
+        ports: [{name: https, port: 443.0, protocol: TCP}]
+tests:
+  - it: renders the Service and the endpoint when both answer
+    kubernetesProvider:
+      objects:
+        - apiVersion: discovery.k8s.io/v1
+          kind: EndpointSlice
+          metadata: {name: kubernetes, namespace: default}
+          addressType: IPv4
+          ports: [{name: https, port: 443.0, protocol: TCP}]
+          endpoints: [{addresses: ["10.156.0.38"], conditions: {ready: true}}]
+    documentSelector: {path: kind, value: NetworkPolicy}
+    asserts:
+      - equal:
+          path: spec.egress
+          value:
+            - to: [{ipBlock: {cidr: 34.118.224.1/32}}]
+              ports: [{protocol: TCP, port: 443}]
+            - to: [{ipBlock: {cidr: 10.156.0.38/32}}]
+              ports: [{protocol: TCP, port: 443}]
+  - it: refuses to render while the EndpointSlice lists no address
+    kubernetesProvider:
+      objects:
+        - apiVersion: discovery.k8s.io/v1
+          kind: EndpointSlice
+          metadata: {name: kubernetes, namespace: default}
+          addressType: IPv4
+          ports: [{name: https, port: 443.0, protocol: TCP}]
+          endpoints: []
+    asserts:
+      - failedTemplate:
+          errorPattern: "lists no apiserver address right now"
+  - it: refuses to render while there is no EndpointSlice
+    asserts:
+      - failedTemplate:
+          errorPattern: "lists no apiserver address right now"
+  - it: doesn't look anything up when the address is set
+    set:
+      checks.networkPolicy.apiServer: [{cidr: 10.0.0.1/32, ports: [443]}]
+    documentSelector: {path: kind, value: NetworkPolicy}
+    asserts:
+      - equal:
+          path: spec.egress
+          value:
+            - to: [{ipBlock: {cidr: 10.0.0.1/32}}]
+              ports: [{protocol: TCP, port: 443}]
+  - it: renders with the policy off, whatever the cluster answers
+    set:
+      checks.networkPolicy.enabled: false
+    asserts:
+      - containsDocument: {kind: NetworkPolicy, apiVersion: networking.k8s.io/v1, any: true}
+        not: true

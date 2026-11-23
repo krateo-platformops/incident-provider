@@ -64,22 +64,32 @@ subjects:
 {{- $np := .Values.checks.networkPolicy }}
 {{- $apiServer := $np.apiServer }}
 {{- if not $apiServer }}
-{{- with (lookup "v1" "Service" "default" "kubernetes") }}
+{{- $service := lookup "v1" "Service" "default" "kubernetes" }}
+{{- with $service }}
 {{- $ports := list }}
 {{- range .spec.ports }}{{ $ports = append $ports .port }}{{ end }}
 {{- range .spec.clusterIPs }}
 {{- $apiServer = append $apiServer (dict "cidr" (printf "%s/%s" . (ternary "128" "32" (contains ":" .))) "ports" $ports) }}
 {{- end }}
 {{- end }}
+{{- $endpoints := list }}
 {{- with (lookup "discovery.k8s.io/v1" "EndpointSlice" "default" "kubernetes") }}
 {{- $ports := list }}
 {{- range .ports }}{{ $ports = append $ports .port }}{{ end }}
 {{- range .endpoints }}
 {{- range .addresses }}
-{{- $apiServer = append $apiServer (dict "cidr" (printf "%s/%s" . (ternary "128" "32" (contains ":" .))) "ports" $ports) }}
+{{- $endpoints = append $endpoints (dict "cidr" (printf "%s/%s" . (ternary "128" "32" (contains ":" .))) "ports" $ports) }}
 {{- end }}
 {{- end }}
 {{- end }}
+{{- /* The Service answered, so this render has a cluster; no endpoint address then means a moment in which
+     the apiserver is not registered (a control-plane repair), not a cluster without one. Rendering on
+     would narrow the live policy and cut the checks off, then widen it again: refuse, so the release
+     keeps the policy it has and the next reconcile renders it whole. */}}
+{{- if and $service (not $endpoints) }}
+{{- fail "the kubernetes EndpointSlice in namespace default lists no apiserver address right now (a control-plane repair or restart): refusing to render a check NetworkPolicy without it. It clears by itself; to not depend on the lookup, set checks.networkPolicy.apiServer." }}
+{{- end }}
+{{- $apiServer = concat $apiServer $endpoints }}
 {{- end }}
 ---
 # Check pods reach the apiserver, by IP, and nothing else; they accept no traffic. No DNS: the

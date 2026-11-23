@@ -45,12 +45,13 @@ lint: ## run go vet, the integration tests included
 	go vet -tags integration ./...
 
 .PHONY: lint-charts
-lint-charts: ## helm lint and render every chart, with CHART_VERSION set to 0.0.0
+lint-charts: ## helm lint, render and unit-test every chart (helm-unittest), with CHART_VERSION set to 0.0.0
 	@tmp="$$(mktemp -d)"; trap 'rm -rf "$$tmp"' EXIT; \
 	  for c in helm/*/; do \
 	    n="$$(basename "$$c")"; cp -R "$$c" "$$tmp/$$n"; \
 	    sed -i.bak 's/CHART_VERSION/0.0.0/g' "$$tmp/$$n/Chart.yaml"; \
 	    helm lint --strict "$$tmp/$$n" && helm template "$$n" "$$tmp/$$n" >/dev/null || exit 1; \
+	    if [ -d "$$tmp/$$n/tests" ]; then helm unittest "$$tmp/$$n" || exit 1; fi; \
 	  done
 
 .PHONY: image
