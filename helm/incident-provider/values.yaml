@@ -105,6 +105,8 @@ checks:
   networkPolicy:
     enabled: true
     # The only egress: the apiserver, [{cidr: 10.0.0.1/32, ports: [443]}]. Empty means the
-    # kubernetes Service and its EndpointSlice are looked up at install; a render without cluster
-    # access (helm template) then allows no egress at all, so checks cannot reach the apiserver.
+    # kubernetes Service and its EndpointSlice are looked up at every render; a render without cluster
+    # access (helm template) then allows no egress at all, so checks cannot reach the apiserver. With a
+    # cluster whose EndpointSlice lists no address at that moment (a control-plane repair), the render
+    # is refused and the live policy stays as it is.
     apiServer: []

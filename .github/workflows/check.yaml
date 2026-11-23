@@ -24,5 +24,7 @@ jobs:
       - uses: azure/setup-helm@v5.0.0
         with:
           version: v3.19.0
+      - name: helm-unittest, for the charts' tests
+        run: helm plugin install https://github.com/helm-unittest/helm-unittest --version v1.2.1
       - name: Build, vet, test, lint the charts and check the generated files are current
         run: make check

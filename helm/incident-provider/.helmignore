@@ -1,0 +1,2 @@
+# The chart's unit tests (helm-unittest) are not part of the package.
+tests/

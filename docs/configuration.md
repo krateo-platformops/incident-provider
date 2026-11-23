@@ -88,7 +88,7 @@ pod, and `KUBECONFIG=/kube/config`; its deadline is `-apply-timeout`.
 | `checks.image.*` | `ghcr.io/krateo-platformops/incident-provider-check`, appVersion | bash, kubectl and jq |
 | `checks.imagePullSecrets`, `resources`, `podSecurityContext`, `nodeSelector`, `tolerations` | | the check pod template |
 | `checks.networkPolicy.enabled` | `true` | the check NetworkPolicy |
-| `checks.networkPolicy.apiServer` | `[]` | `[{cidr, ports}]`; empty looks the apiserver up at install |
+| `checks.networkPolicy.apiServer` | `[]` | `[{cidr, ports}]`; empty looks the apiserver up at every render |
 
 ## What the check pods can do
 
@@ -107,10 +107,12 @@ pod, and `KUBECONFIG=/kube/config`; its deadline is `-apply-timeout`.
   get none: the controller sets `dnsPolicy: None` with `127.0.0.1` as the only
   nameserver, since a lookup that reaches cluster DNS is forwarded outside and
   would carry data out. With `checks.networkPolicy.apiServer` empty, the chart
-  looks up the `kubernetes` Service and its EndpointSlice at install and allows
-  their addresses and ports. A render without cluster access (`helm template`)
-  finds neither: the policy then allows no egress, and the install notes say
-  so.
+  looks up the `kubernetes` Service and its EndpointSlice at every render and
+  allows their addresses and ports. A render without cluster access
+  (`helm template`) finds neither: the policy then allows no egress, and the
+  install notes say so. When the Service answers and the slice lists no address
+  (the apiserver is not registered for a moment, in a control-plane repair), the
+  render is refused and the live policy stays as it is until the next one.
   Cilium does not match node addresses with an ipBlock by default; where the
   apiserver runs on the nodes, allow it with a CiliumNetworkPolicy
   (`toEntities: [kube-apiserver]`).
