@@ -13,6 +13,8 @@ import (
 	"github.com/go-logr/logr"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/labels"
+	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
+	"k8s.io/client-go/rest"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -84,6 +86,8 @@ func main() {
 	if err := run(log, runOptions{
 		syncPeriod:      *syncPeriod,
 		leaderElection:  *leaderElection,
+		metricsAddr:     ":8080",
+		probeAddr:       ":8081",
 		checksNamespace: *checksNamespace,
 		podTemplate:     *checkPodTemplate,
 		checkReader:     checkreader.Options{Role: *checkReaderRole, Interval: *checkReaderRefresh, Log: log},
@@ -115,6 +119,8 @@ func main() {
 type runOptions struct {
 	syncPeriod      time.Duration
 	leaderElection  bool
+	metricsAddr     string
+	probeAddr       string
 	checksNamespace string
 	podTemplate     string
 	checkReader     checkreader.Options
@@ -159,6 +165,21 @@ func run(log logging.Logger, o runOptions) error {
 	if err != nil {
 		return fmt.Errorf("cannot get API server rest config: %w", err)
 	}
+	mgr, err := newManager(cfg, o)
+	if err != nil {
+		return err
+	}
+	return mgr.Start(ctrl.SetupSignalHandler())
+}
+
+// newManager is the manager the process runs, with every controller set up.
+func newManager(cfg *rest.Config, o runOptions) (ctrl.Manager, error) {
+	// Before the manager: creating it resolves the kinds of its cache's ByObject against its scheme,
+	// and an unregistered one is an error. It is client-go's global scheme, the manager's default,
+	// which the event recorder also reads.
+	if err := apis.AddToScheme(clientgoscheme.Scheme); err != nil {
+		return nil, fmt.Errorf("cannot add APIs to scheme: %w", err)
+	}
 
 	// Check and apply pods and their ConfigMaps are cached only in the checks namespace. Secrets
 	// are never cached: the credentials are read past the cache, one at a time.
@@ -176,30 +197,27 @@ func run(log logging.Logger, o runOptions) error {
 			// closedBy reads them to tell a person's close from the writer's.
 			ByObject: byObject(checkObjects),
 		},
-		Metrics:                metricsserver.Options{BindAddress: ":8080"},
-		HealthProbeBindAddress: ":8081",
+		Metrics:                metricsserver.Options{BindAddress: o.metricsAddr},
+		HealthProbeBindAddress: o.probeAddr,
 	})
 	if err != nil {
-		return fmt.Errorf("cannot create controller manager: %w", err)
+		return nil, fmt.Errorf("cannot create controller manager: %w", err)
 	}
 	if err := mgr.AddHealthzCheck("healthz", healthz.Ping); err != nil {
-		return err
+		return nil, err
 	}
 	if err := mgr.AddReadyzCheck("readyz", healthz.Ping); err != nil {
-		return err
-	}
-	if err := apis.AddToScheme(mgr.GetScheme()); err != nil {
-		return fmt.Errorf("cannot add APIs to scheme: %w", err)
+		return nil, err
 	}
 	if err := controllers.Setup(mgr, o.incident, o.apply); err != nil {
-		return fmt.Errorf("cannot set up controllers: %w", err)
+		return nil, fmt.Errorf("cannot set up controllers: %w", err)
 	}
 	if o.checkReader.Role != "" {
 		if err := checkreader.Setup(mgr, o.checkReader); err != nil {
-			return fmt.Errorf("cannot set up the check reader role: %w", err)
+			return nil, fmt.Errorf("cannot set up the check reader role: %w", err)
 		}
 	}
-	return mgr.Start(ctrl.SetupSignalHandler())
+	return mgr, nil
 }
 
 // byObject is the manager's per-kind cache configuration: check pods and their ConfigMaps in the
