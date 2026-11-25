@@ -1,0 +1,22 @@
+# Published versions that must not be pinned.
+#
+# A tag cannot be withdrawn: it stays in the registry and looks like any other release. This list is
+# how a release is marked bad where a pinning session will see it. The platform installer's CI reads
+# it from this repository's root and refuses a pin on a listed version.
+#
+# An entry is a claim about this repository's OWN release, so its reason says what was measured and
+# what was inferred. A version that is merely superseded does not belong here.
+#
+# `charts` names charts this repository publishes (helm/<chart>; retracted_versions_test.go checks
+# it). `use` is the version to pin instead.
+retracted:
+  - versions: [0.15.0, 0.16.0, 0.17.0, 0.17.1]
+    charts: [incident-provider]
+    use: 0.17.2
+    reason: >-
+      The controller exits at start with "cannot create controller manager: failed to determine if
+      *v1alpha1.Incident is namespaced: no kind is registered", because the manager's cache names the
+      Incident kind before it was registered (#44). MEASURED on 0.17.1: the released chart and image
+      on a fresh cluster went to CrashLoopBackOff. INFERRED from the source, not run: 0.15.0, 0.16.0
+      and 0.17.0 have the same order and the same cache, and 0.14.0 does not. Only the controller
+      chart is affected; incident-provider-crds at these versions is not. Fixed in 0.17.2.
